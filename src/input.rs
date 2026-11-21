@@ -84,7 +84,7 @@
 //! ```
 
 use alacritty_terminal::term::TermMode;
-use gpui::Keystroke;
+use crate::backend::Keystroke;
 
 /// Convert a GPUI keystroke to terminal escape sequence bytes.
 ///

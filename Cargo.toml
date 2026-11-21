@@ -7,8 +7,16 @@ description = "Terminal emulator component for gpui"
 repository = "https://github.com/zortax/gpui-terminal"
 authors = ["Leonard Seibold <git[@]zrtx.de"]
 
+[features]
+default = ["gpui"]
+
+gpui = ["dep:gpui"]
+gpui-kit = ["dep:gpui-kit"]
+
+
 [dependencies]
-gpui = "0.2.2"
+gpui = { version = "0.2.2", optional = true }
+gpui-kit = { version = "0.10.0", optional = true }
 alacritty_terminal = "0.25.1"
 anyhow = "1"
 portable-pty = "0.9"

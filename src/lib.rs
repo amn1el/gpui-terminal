@@ -336,6 +336,12 @@
 //!
 //! Use a monospace font. Nerd fonts work well with `line_height_multiplier: 1.0`
 //! to accommodate tall glyphs.
+#[cfg(all(feature = "gpui", feature = "gpui-kit"))]
+compile_error!(
+    "The 'gpui' and 'gpui-kit' features are mutually exclusive.
+    Use `default-features = false` and enable only the one you need."
+);
+mod backend;
 
 pub mod box_drawing;
 pub mod clipboard;

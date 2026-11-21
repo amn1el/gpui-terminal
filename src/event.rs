@@ -44,13 +44,13 @@
 //! [`EventListener`]: alacritty_terminal::event::EventListener
 
 use alacritty_terminal::event::{Event, EventListener};
-use std::sync::mpsc::Sender;
+use std::sync::{Arc, mpsc::Sender};
 
 /// Events emitted by the terminal that the GPUI application cares about.
 ///
 /// This enum represents a subset of alacritty's events that are relevant
 /// for the GPUI terminal emulator implementation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum TerminalEvent {
     /// The terminal has new content to display and needs a redraw.
     Wakeup,
@@ -61,11 +61,13 @@ pub enum TerminalEvent {
     /// The terminal title has changed.
     Title(String),
 
+    PtyWrite(String),
+
     /// The terminal wants to store data to the clipboard.
     ClipboardStore(String),
 
     /// The terminal wants to load data from the clipboard.
-    ClipboardLoad,
+    ClipboardLoad(Arc<dyn Fn(&str) -> String + Sync + Send + 'static>),
 
     /// The terminal process has exited.
     Exit,
@@ -135,17 +137,20 @@ impl EventListener for GpuiEventProxy {
                 // For simplicity, we ignore the clipboard type and just store the data
                 self.send(TerminalEvent::ClipboardStore(data));
             }
-            Event::ClipboardLoad(_clipboard_type, _format) => {
-                // For simplicity, we ignore the clipboard type and format
-                self.send(TerminalEvent::ClipboardLoad);
+            Event::ClipboardLoad(_clipboard_type, format) => {
+                // For simplicity, we ignore the clipboard type
+                self.send(TerminalEvent::ClipboardLoad(format));
             }
             Event::Exit => {
                 self.send(TerminalEvent::Exit);
             }
             // Ignore events we don't care about
             Event::MouseCursorDirty => {}
-            Event::PtyWrite(ref _data) => {
+            Event::PtyWrite(data) => {
                 // This is handled internally by alacritty
+                #[cfg(windows)]
+                let _ = self.tx.send(TerminalEvent::PtyWrite(data));
+                // TODO: check this in unix
             }
             Event::ColorRequest(ref _index, ref _format) => {
                 // Color requests are not commonly used
@@ -247,7 +252,9 @@ mod tests {
         proxy.send_event(Event::ClipboardLoad(ClipboardType::Clipboard, callback));
 
         let event = rx.recv().unwrap();
-        assert!(matches!(event, TerminalEvent::ClipboardLoad));
+        if let TerminalEvent::ClipboardLoad(_f) = rx.recv().unwrap() {
+            assert!(matches!(event, TerminalEvent::ClipboardLoad(_f)));
+        }
     }
 
     #[test]

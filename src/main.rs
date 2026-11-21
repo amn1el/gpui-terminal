@@ -5,8 +5,8 @@
 
 use anyhow::Result;
 use gpui::{
-    AppContext, Context, Edges, Entity, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, Styled, Window, div, px,
+    AppContext, Application, Context, Edges, Entity, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, Styled, TitlebarOptions, Window, WindowOptions, div, px,
 };
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -58,11 +58,15 @@ impl Render for TerminalApp {
 }
 
 fn main() -> Result<()> {
-    let app = gpui::Application::new();
+    let app = Application::new();
 
     app.run(move |cx| {
         // Get shell from environment
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        #[cfg(windows)]
+        let shell = "pwsh.exe";
+
+        #[cfg(unix)]
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
 
         // Create PTY system
         let pty_system = native_pty_system();
@@ -78,7 +82,7 @@ fn main() -> Result<()> {
             .expect("Failed to open PTY");
 
         // Spawn shell in the PTY
-        let mut cmd = CommandBuilder::new(&shell);
+        let mut cmd = CommandBuilder::new(shell);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
 
@@ -128,13 +132,14 @@ fn main() -> Result<()> {
                 .build();
 
             let config = TerminalConfig {
-                font_family: "Mononoki Nerd Font".into(),
+                font_family: "Cascadia Code".into(),
                 font_size: px(14.0),
                 cols: 80,
                 rows: 24,
                 scrollback: 10000,
                 line_height_multiplier: 1.0,
                 padding: Edges::all(px(8.0)),
+                copy_on_select: true,
                 colors,
             };
 
@@ -152,8 +157,8 @@ fn main() -> Result<()> {
             };
 
             cx.open_window(
-                gpui::WindowOptions {
-                    titlebar: Some(gpui::TitlebarOptions {
+                WindowOptions {
+                    titlebar: Some(TitlebarOptions {
                         title: Some("gpui-terminal".into()),
                         ..Default::default()
                     }),
@@ -169,11 +174,19 @@ fn main() -> Result<()> {
                             })
                     });
 
+                    // Wrap in TerminalApp to handle font size shortcuts
+                    let app = cx.new(|_cx| TerminalApp::new(terminal.clone()));
+
                     // Focus the terminal so it receives key events
+                    #[cfg(feature = "gpui")]
                     terminal.read(cx).focus_handle().focus(window);
 
-                    // Wrap in TerminalApp to handle font size shortcuts
-                    cx.new(|_cx| TerminalApp::new(terminal))
+                    #[cfg(feature = "gpui-kit")]
+                    terminal.update(cx, |entity, cx| {
+                        entity.focus_handle().focus(window, cx);
+                    });
+
+                    app
                 },
             )?;
 

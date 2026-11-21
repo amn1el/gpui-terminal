@@ -73,9 +73,9 @@
 //! let bytes = mouse_button_report(MouseButton::Left, true, point, 0, mode);
 //! ```
 
+use crate::backend::{MouseButton, Pixels, Point};
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::term::TermMode;
-use gpui::{MouseButton, Pixels, Point};
 
 /// Type of text selection in the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,7 +479,7 @@ pub fn pixels_to_scroll_lines(pixel_delta: Pixels, cell_height: Pixels) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{point, px};
+    use crate::backend::{point, px};
 
     #[test]
     fn test_pixel_to_cell() {

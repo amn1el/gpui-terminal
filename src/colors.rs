@@ -55,9 +55,9 @@
 //!     .build();
 //! ```
 
+use crate::backend::Hsla;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
-use gpui::Hsla;
 
 /// A color palette that maps ANSI colors to GPUI Hsla colors.
 ///

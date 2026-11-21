@@ -60,6 +60,11 @@
 //! );
 //! ```
 
+use crate::backend::{
+    App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
+    SharedString, Size, TextRun, UnderlineStyle, Window, paint_shaped_line, px, quad,
+    transparent_black,
+};
 use crate::box_drawing;
 use crate::colors::ColorPalette;
 use crate::event::GpuiEventProxy;
@@ -69,10 +74,6 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::Color;
-use gpui::{
-    App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
-    SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
-};
 
 /// A batched run of text with consistent styling.
 ///
@@ -255,7 +256,7 @@ impl TerminalRenderer {
         let text_run = TextRun {
             len: "│".len(),
             font,
-            color: gpui::black(),
+            color: crate::backend::black(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -455,6 +456,10 @@ impl TerminalRenderer {
         bounds: Bounds<Pixels>,
         padding: Edges<Pixels>,
         term: &Term<GpuiEventProxy>,
+        selection: Option<(
+            alacritty_terminal::index::Point,
+            alacritty_terminal::index::Point,
+        )>,
         window: &mut Window,
         _cx: &mut App,
     ) {
@@ -463,6 +468,7 @@ impl TerminalRenderer {
         let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
         let colors = term.colors();
+        let display_offset = grid.display_offset() as i32;
 
         // Calculate default background color
         let default_bg = self.palette.resolve(
@@ -486,9 +492,53 @@ impl TerminalRenderer {
             y: bounds.origin.y + padding.top,
         };
 
+        let sel = selection.map(|(mut start, mut end)| {
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+            (start, end)
+        });
+
         // Iterate over visible lines
         for line_idx in 0..num_lines {
-            let line = Line(line_idx as i32);
+            let line = Line(line_idx as i32 - display_offset);
+
+            if let Some((start, end)) = sel
+                && line >= start.line
+                && line <= end.line
+            {
+                let start_col = if line == start.line {
+                    start.column.0
+                } else {
+                    0
+                };
+                let end_col = if line == end.line {
+                    end.column.0
+                } else {
+                    num_cols - 1
+                };
+
+                if start_col <= end_col {
+                    let x = origin.x + self.cell_width * (start_col as f32);
+                    let y = origin.y + self.cell_height * (line_idx as f32);
+                    let width = self.cell_width * ((end_col - start_col + 1) as f32);
+                    let height = self.cell_height;
+
+                    let rect_bounds = Bounds {
+                        origin: Point { x, y },
+                        size: Size { width, height },
+                    };
+
+                    window.paint_quad(quad(
+                        rect_bounds,
+                        px(0.0),
+                        crate::backend::rgba(0x3b82f680),
+                        Edges::<Pixels>::default(),
+                        transparent_black(),
+                        Default::default(),
+                    ));
+                }
+            }
 
             // Collect cells for this line
             let cells: Vec<(usize, Cell)> = (0..num_cols)
@@ -543,7 +593,8 @@ impl TerminalRenderer {
 
             // First pass: find and draw horizontal spans of box-drawing characters
             // This draws continuous lines across multiple cells to avoid gaps
-            let mut processed_horizontal: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut processed_horizontal: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
 
             let mut i = 0;
             while i < cells_vec.len() {
@@ -710,39 +761,42 @@ impl TerminalRenderer {
                         .shape_line(text, self.font_size, &[text_run], None);
 
                 // Paint at exact cell position (ignore errors)
-                let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
+                let _ =
+                    paint_shaped_line(&shaped_line, Point { x, y }, self.cell_height, window, _cx);
             }
         }
 
         // Paint cursor
-        let cursor_point = grid.cursor.point;
-        let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
-        let cursor_y = origin.y + self.cell_height * (cursor_point.line.0 as f32);
+        if display_offset == 0 {
+            let cursor_point = grid.cursor.point;
+            let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
+            let cursor_y = origin.y + self.cell_height * (cursor_point.line.0 as f32);
 
-        let cursor_color = self.palette.resolve(
-            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
-            colors,
-        );
+            let cursor_color = self.palette.resolve(
+                Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
+                colors,
+            );
 
-        let cursor_bounds = Bounds {
-            origin: Point {
-                x: cursor_x,
-                y: cursor_y,
-            },
-            size: Size {
-                width: self.cell_width,
-                height: self.cell_height,
-            },
-        };
+            let cursor_bounds = Bounds {
+                origin: Point {
+                    x: cursor_x,
+                    y: cursor_y,
+                },
+                size: Size {
+                    width: self.cell_width,
+                    height: self.cell_height,
+                },
+            };
 
-        window.paint_quad(quad(
-            cursor_bounds,
-            px(0.0),
-            cursor_color,
-            Edges::<Pixels>::default(),
-            transparent_black(),
-            Default::default(),
-        ));
+            window.paint_quad(quad(
+                cursor_bounds,
+                px(0.0),
+                cursor_color,
+                Edges::<Pixels>::default(),
+                transparent_black(),
+                Default::default(),
+            ));
+        }
     }
 }
 

@@ -47,12 +47,16 @@
 //! terminal.read(cx).focus_handle().focus(window);
 //! ```
 
+use alacritty_terminal::Term;
+use alacritty_terminal::grid::Dimensions;
+use gpui::prelude::FluentBuilder;
+
+use crate::backend::{Edges, *};
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
-use gpui::{Edges, *};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -75,6 +79,7 @@ use std::thread;
 /// | `line_height_multiplier` | 1.0 |
 /// | `padding` | 0px all sides |
 /// | `colors` | Default palette |
+/// | `copy_on_selection` | false |
 ///
 /// # Example
 ///
@@ -89,6 +94,7 @@ use std::thread;
 ///     font_size: px(13.0),
 ///     scrollback: 50000,
 ///     line_height_multiplier: 1.0,
+///     copy_on_selection: true,
 ///     padding: Edges::all(px(10.0)),
 ///     colors: ColorPalette::builder()
 ///         .background(0x1a, 0x1a, 0x1a)
@@ -137,6 +143,9 @@ pub struct TerminalConfig {
     /// Color palette for terminal colors (16 ANSI colors, 256 extended colors,
     /// foreground, background, and cursor colors)
     pub colors: ColorPalette,
+
+    /// Copy to clipboard on text selection
+    pub copy_on_select: bool,
 }
 
 impl Default for TerminalConfig {
@@ -150,6 +159,7 @@ impl Default for TerminalConfig {
             line_height_multiplier: 1.0,
             padding: Edges::all(px(0.0)),
             colors: ColorPalette::default(),
+            copy_on_select: false,
         }
     }
 }
@@ -297,6 +307,14 @@ pub type TitleCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &st
 /// ```
 pub type ClipboardStoreCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &str)>;
 
+/// Callback for clipboard load requests.
+///
+/// This is invoked when an application inside the terminal wants to paste text
+/// via OSC 52. The callback should return the text from the system clipboard,
+/// or `None` if the request is denied (e.g., for security reasons).
+pub type ClipboardLoadCallback =
+    Box<dyn Fn(&mut Window, &mut Context<TerminalView>) -> Option<String>>;
+
 /// Callback for terminal exit events.
 ///
 /// This callback is invoked when the terminal process exits (e.g., shell exits,
@@ -409,8 +427,20 @@ pub struct TerminalView {
     /// Callback for clipboard store requests
     clipboard_store_callback: Option<ClipboardStoreCallback>,
 
+    /// Callback for clipboard load requests
+    clipboard_load_callback: Option<ClipboardLoadCallback>,
+
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
+
+    /// Scroll accumulator up/down
+    scroll_accumulator: f32,
+
+    /// Start selection
+    selection_start: Option<alacritty_terminal::index::Point>,
+
+    /// End selection
+    selection_end: Option<alacritty_terminal::index::Point>,
 }
 
 impl TerminalView {
@@ -530,8 +560,12 @@ impl TerminalView {
             key_handler: None,
             bell_callback: None,
             title_callback: None,
+            selection_start: None,
+            selection_end: None,
             clipboard_store_callback: None,
+            clipboard_load_callback: None,
             exit_callback: None,
+            scroll_accumulator: 0.,
         }
     }
 
@@ -653,6 +687,29 @@ impl TerminalView {
         self
     }
 
+    /// Set a callback to be invoked when the terminal wants to load data from the clipboard.
+    ///
+    /// The callback should return the current text in the system clipboard, or `None` to deny the request.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// terminal.with_clipboard_load_callback(|window, cx| {
+    ///     // Option 1: Use the gpui clipboard
+    ///     cx.read_from_clipboard().and_then(|item| item.text())
+    ///     
+    ///     // Option 2: Always deny for safety
+    ///     // None
+    /// })
+    /// ```
+    pub fn with_clipboard_load_callback(
+        mut self,
+        callback: impl Fn(&mut Window, &mut Context<TerminalView>) -> Option<String> + 'static,
+    ) -> Self {
+        self.clipboard_load_callback = Some(Box::new(callback));
+        self
+    }
+
     /// Set a callback to be invoked when the terminal process exits.
     ///
     /// The callback receives a mutable reference to the window and context,
@@ -715,18 +772,96 @@ impl TerminalView {
     /// Converts GPUI keystrokes to terminal escape sequences and writes them
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        // Check if key handler wants to consume this event
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let mode = self.state.mode();
+
+        let is_ctrl_c = keystroke.key == "c" && keystroke.modifiers.control;
+        if is_ctrl_c {
+            if let (Some(start), Some(end)) = (self.selection_start, self.selection_end)
+                && start != end
+            {
+                let text = self.get_selected_text();
+                if !text.is_empty() {
+                    self.copy_to_clipboard(text, window, cx);
+                    if !keystroke.modifiers.shift {
+                        self.selection_start = None;
+                        self.selection_end = None;
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+
+            if keystroke.modifiers.shift {
+                return;
+            }
+        }
+
+        if keystroke.modifiers.shift
+            && matches!(keystroke.key.as_str(), "up" | "down" | "left" | "right")
+        {
+            self.state.with_term_mut(|term| {
+                if self.selection_start.is_none() {
+                    let cursor = term.grid().cursor.point;
+                    self.selection_start = Some(cursor);
+                    self.selection_end = Some(cursor);
+                }
+
+                if let Some(mut end) = self.selection_end {
+                    match keystroke.key.as_str() {
+                        "up" => {
+                            let new_line =
+                                (end.line.0 - 1).max(-(term.grid().display_offset() as i32));
+                            end.line = alacritty_terminal::index::Line(new_line);
+                        }
+                        "down" => {
+                            let new_line =
+                                (end.line.0 + 1).min(term.grid().screen_lines() as i32 - 1);
+                            end.line = alacritty_terminal::index::Line(new_line);
+                        }
+                        "left" => {
+                            let new_col = (end.column.0 as i32 - 1).max(0) as usize;
+                            end.column = alacritty_terminal::index::Column(new_col);
+                        }
+                        "right" => {
+                            let new_col =
+                                (end.column.0 as i32 + 1).min(term.columns() as i32 - 1) as usize;
+                            end.column = alacritty_terminal::index::Column(new_col);
+                        }
+                        _ => unreachable!(),
+                    }
+                    self.selection_end = Some(end);
+                }
+            });
+
+            cx.notify();
+            return;
+        }
+
         if let Some(ref handler) = self.key_handler
             && handler(event)
         {
-            return; // Event consumed by handler
+            return;
         }
 
-        if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
+        if let Some(bytes) = keystroke_to_bytes(&event.keystroke, mode) {
             let mut writer = self.stdin_writer.lock();
             let _ = writer.write_all(&bytes);
             let _ = writer.flush();
+
+            if self.selection_start.is_some() {
+                self.selection_start = None;
+                self.selection_end = None;
+            }
+
+            self.state.with_term_mut(|term| {
+                if term.grid().display_offset() != 0 {
+                    term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+                    self.scroll_accumulator = 0.0;
+                }
+            });
+            cx.notify();
         }
     }
 
@@ -735,32 +870,142 @@ impl TerminalView {
     /// Currently a placeholder for future mouse selection and interaction support.
     fn on_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Request focus when clicking the terminal
+        #[cfg(feature = "gpui")]
         window.focus(&self.focus_handle);
-        cx.notify();
 
-        // TODO: Implement mouse selection
-        // - Convert pixel coordinates to cell coordinates
-        // - Start selection at clicked cell
-        // - Send mouse reports if mouse tracking is enabled
+        #[cfg(feature = "gpui-kit")]
+        window.focus(&self.focus_handle, cx);
+
+        if event.click_count == 2 {
+            self.state.with_term_mut(|term| {
+                let point = point_to_cell(
+                    self.config.padding,
+                    self.renderer.cell_width,
+                    self.renderer.cell_height,
+                    event.position,
+                    term,
+                );
+
+                let mut start = point;
+                while start.column.0 > 0 {
+                    let prev_cell = &term.grid()[alacritty_terminal::index::Point::new(
+                        start.line,
+                        alacritty_terminal::index::Column(start.column.0 - 1),
+                    )];
+                    if prev_cell.c.is_whitespace() {
+                        break;
+                    }
+                    start.column.0 -= 1;
+                }
+
+                let mut end = point;
+                while end.column.0 < term.columns() - 1 {
+                    let next_cell = &term.grid()[alacritty_terminal::index::Point::new(
+                        end.line,
+                        alacritty_terminal::index::Column(end.column.0 + 1),
+                    )];
+                    if next_cell.c.is_whitespace() {
+                        break;
+                    }
+                    end.column.0 += 1;
+                }
+
+                self.selection_start = Some(start);
+                self.selection_end = Some(end);
+            });
+            cx.notify();
+            return;
+        }
+
+        let mode = self.state.mode();
+        if mode.intersects(
+            alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                | alacritty_terminal::term::TermMode::MOUSE_MOTION,
+        ) {
+            self.state.with_term_mut(|term| {
+                let point = point_to_cell(
+                    self.config.padding,
+                    self.renderer.cell_width,
+                    self.renderer.cell_height,
+                    event.position,
+                    term,
+                );
+                let col = point.column.0 + 1;
+                let line = point.line.0 + 1;
+
+                if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
+                    // \x1b[<0;{col};{line}M  (0 = Left buttom)
+                    let seq = format!("\x1b[<0;{};{}M", col, line);
+                    let mut writer = self.stdin_writer.lock();
+                    let _ = writer.write_all(seq.as_bytes());
+                    let _ = writer.flush();
+                } else {
+                    // Mode X10 legacy
+                }
+            });
+            return;
+        }
+
+        self.state.with_term_mut(|term| {
+            let point = point_to_cell(
+                self.config.padding,
+                self.renderer.cell_width,
+                self.renderer.cell_height,
+                event.position,
+                term,
+            );
+            self.selection_start = Some(point);
+            self.selection_end = Some(point);
+        });
+
+        cx.notify();
     }
 
     /// Handle mouse up events.
     ///
     /// Currently a placeholder for future mouse selection support.
-    fn on_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO: Implement mouse selection
-        // - End selection at released cell
-        // - Copy selection to clipboard if configured
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = self.state.mode();
+
+        if mode.intersects(alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK) {
+            self.state.with_term_mut(|term| {
+                let point = point_to_cell(
+                    self.config.padding,
+                    self.renderer.cell_width,
+                    self.renderer.cell_height,
+                    event.position,
+                    term,
+                );
+                let col = point.column.0 + 1;
+                let line = point.line.0 + 1;
+
+                if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
+                    let seq = format!("\x1b[<0;{};{}m", col, line);
+                    let mut writer = self.stdin_writer.lock();
+                    let _ = writer.write_all(seq.as_bytes());
+                    let _ = writer.flush();
+                }
+            });
+            return;
+        }
+
+        if let (Some(start), Some(end)) = (self.selection_start, self.selection_end)
+            && start != end
+        {
+            let selected_text = self.get_selected_text();
+
+            if self.config.copy_on_select && !selected_text.is_empty() {
+                self.copy_to_clipboard(selected_text, window, cx);
+                self.selection_start = None;
+                self.selection_end = None;
+            }
+        }
+
+        cx.notify();
     }
 
     /// Handle mouse move events.
@@ -768,27 +1013,138 @@ impl TerminalView {
     /// Currently a placeholder for future mouse selection support.
     fn on_mouse_move(
         &mut self,
-        _event: &MouseMoveEvent,
+        event: &MouseMoveEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - Update selection range while dragging
-        // - Send mouse motion reports if mouse tracking is enabled
+        let mode = self.state.mode();
+
+        if mode.contains(alacritty_terminal::term::TermMode::MOUSE_MOTION)
+            && event.pressed_button == Some(MouseButton::Left)
+        {
+            self.state.with_term_mut(|term| {
+                let point = point_to_cell(
+                    self.config.padding,
+                    self.renderer.cell_width,
+                    self.renderer.cell_height,
+                    event.position,
+                    term,
+                );
+                let col = point.column.0 + 1;
+                let line = point.line.0 + 1;
+
+                if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
+                    let seq = format!("\x1b[<32;{};{}M", col, line);
+                    let mut writer = self.stdin_writer.lock();
+                    let _ = writer.write_all(seq.as_bytes());
+                    let _ = writer.flush();
+                }
+            });
+            return;
+        }
+
+        if self.selection_start.is_some() && event.pressed_button == Some(MouseButton::Left) {
+            self.state.with_term_mut(|term| {
+                self.selection_end = Some(point_to_cell(
+                    self.config.padding,
+                    self.renderer.cell_width,
+                    self.renderer.cell_height,
+                    event.position,
+                    term,
+                ));
+            });
+            cx.notify(); // force
+        }
     }
 
     /// Handle scroll events.
     ///
     /// Currently a placeholder for future scrollback support.
-    fn on_scroll(
-        &mut self,
-        _event: &ScrollWheelEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    fn on_scroll(&mut self, delta: f32, _window: &mut Window, cx: &mut Context<Self>) {
         // TODO: Implement scrollback
-        // - Scroll the terminal display up/down
-        // - Send scroll reports if alternate screen is not active
+        // - Send scroll reports if alternate screen is not active (missing tests)
+
+        let mode = self.state.mode();
+
+        if mode.contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
+            let lines = delta as i32;
+            if lines != 0 {
+                let bytes = if lines > 0 {
+                    b"\x1b[B".repeat(lines as usize)
+                } else {
+                    b"\x1b[A".repeat((-lines) as usize)
+                };
+
+                let mut writer = self.stdin_writer.lock();
+                let _ = writer.write_all(&bytes);
+                let _ = writer.flush();
+            }
+        } else {
+            self.scroll_accumulator += delta;
+            let lines_to_scroll = self.scroll_accumulator.trunc() as i32;
+
+            if lines_to_scroll != 0 {
+                self.scroll_accumulator -= lines_to_scroll as f32;
+
+                self.state.with_term_mut(|term| {
+                    term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines_to_scroll));
+                });
+
+                cx.notify();
+            }
+        }
+    }
+
+    fn copy_to_clipboard(&self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ref callback) = self.clipboard_store_callback {
+            callback(window, cx, &text);
+        }
+    }
+
+    fn get_selected_text(&self) -> String {
+        let mut text = String::new();
+        if let (Some(mut start), Some(mut end)) = (self.selection_start, self.selection_end) {
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+
+            self.state.with_term_mut(|term| {
+                let grid = term.grid();
+                for line_idx in start.line.0..=end.line.0 {
+                    let line = alacritty_terminal::index::Line(line_idx);
+
+                    let start_col = if line == start.line {
+                        start.column.0
+                    } else {
+                        0
+                    };
+                    let end_col = if line == end.line {
+                        end.column.0
+                    } else {
+                        grid.columns() - 1
+                    };
+
+                    let mut line_str = String::new();
+                    for col_idx in start_col..=end_col {
+                        let cell = &grid[alacritty_terminal::index::Point::new(
+                            line,
+                            alacritty_terminal::index::Column(col_idx),
+                        )];
+                        if cell.c != '\0' {
+                            line_str.push(cell.c);
+                        }
+                    }
+
+                    text.push_str(line_str.trim_end());
+
+                    // add line
+                    if line != end.line {
+                        text.push('\n');
+                    }
+                }
+            });
+        }
+        text
     }
 
     /// Process pending terminal events.
@@ -813,14 +1169,25 @@ impl TerminalView {
                         callback(window, cx, &title);
                     }
                 }
+                TerminalEvent::PtyWrite(text) => {
+                    let mut writer = self.stdin_writer.lock();
+                    let _ = writer.write_all(text.as_bytes());
+                    let _ = writer.flush();
+                }
                 TerminalEvent::ClipboardStore(text) => {
                     if let Some(ref callback) = self.clipboard_store_callback {
                         callback(window, cx, &text);
                     }
                 }
-                TerminalEvent::ClipboardLoad => {
-                    // Terminal wants to load data from clipboard
-                    // TODO: Implement clipboard integration
+                TerminalEvent::ClipboardLoad(formatter) => {
+                    if let Some(ref callback) = self.clipboard_load_callback
+                        && let Some(text) = callback(window, cx)
+                    {
+                        let sequence = formatter(&text);
+                        let mut writer = self.stdin_writer.lock();
+                        let _ = writer.write_all(sequence.as_bytes());
+                        let _ = writer.flush();
+                    }
                 }
                 TerminalEvent::Exit => {
                     if let Some(ref callback) = self.exit_callback {
@@ -912,6 +1279,7 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renderer.measure_cell(window);
         // Process any pending events
         self.process_events(window, cx);
 
@@ -920,6 +1288,8 @@ impl Render for TerminalView {
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
+        let selection_start = self.selection_start;
+        let selection_end = self.selection_end;
 
         div()
             .size_full()
@@ -929,24 +1299,20 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .when(true, |el| attach_scroll(el, Self::on_scroll, cx))
             .child(
                 canvas(
                     move |bounds, _window, _cx| bounds,
                     move |bounds, _, window, cx| {
                         use alacritty_terminal::grid::Dimensions;
 
-                        // Measure actual cell dimensions from the font
-                        let mut measured_renderer = renderer.clone();
-                        measured_renderer.measure_cell(window);
-
                         // Calculate available space after padding
                         let available_width: f32 =
                             (bounds.size.width - padding.left - padding.right).into();
                         let available_height: f32 =
                             (bounds.size.height - padding.top - padding.bottom).into();
-                        let cell_width_f32: f32 = measured_renderer.cell_width.into();
-                        let cell_height_f32: f32 = measured_renderer.cell_height.into();
+                        let cell_width_f32: f32 = renderer.cell_width.into();
+                        let cell_height_f32: f32 = renderer.cell_height.into();
 
                         let cols = ((available_width / cell_width_f32) as usize).max(1);
                         let rows = ((available_height / cell_height_f32) as usize).max(1);
@@ -989,8 +1355,13 @@ impl Render for TerminalView {
                             term.resize(TermSize { cols, rows });
                         }
 
+                        let selection = match (selection_start, selection_end) {
+                            (Some(start), Some(end)) => Some((start, end)),
+                            _ => None,
+                        };
+
                         // Paint the terminal with measured dimensions
-                        measured_renderer.paint(bounds, padding, &term, window, cx);
+                        renderer.paint(bounds, padding, &term, selection, window, cx);
                     },
                 )
                 .size_full(),
@@ -1000,3 +1371,26 @@ impl Render for TerminalView {
 
 // Tests are omitted due to macro expansion issues with the test attribute
 // in this configuration. Integration tests can be added separately.
+
+fn point_to_cell(
+    paddings: Edges<Pixels>,
+    cell_width: Pixels,
+    cell_height: Pixels,
+    pos: Point<Pixels>,
+    term: &Term<GpuiEventProxy>,
+) -> alacritty_terminal::index::Point {
+    let x = pos.x - paddings.left;
+    let y = pos.y - paddings.top;
+
+    let col = (f32::from(x) / f32::from(cell_width)).floor().max(0.0) as usize;
+    let line = (f32::from(y) / f32::from(cell_height)).floor().max(0.0) as usize;
+
+    let col = col.min(term.columns().saturating_sub(1));
+    let line = line.min(term.screen_lines().saturating_sub(1));
+
+    let line_idx =
+        alacritty_terminal::index::Line(line as i32 - term.grid().display_offset() as i32);
+    let col_idx = alacritty_terminal::index::Column(col);
+
+    alacritty_terminal::index::Point::new(line_idx, col_idx)
+}
