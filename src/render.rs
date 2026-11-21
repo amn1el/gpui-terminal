@@ -46,17 +46,34 @@
 //! The `line_height_multiplier` (default 1.0) can be adjusted to add extra
 //! vertical space if needed for specific fonts.
 //!
+//! # Cursor Rendering
+//!
+//! The cursor shape comes from the grid (via [`GridSource::cursor`]) but can
+//! be overridden per renderer through [`TerminalRenderer::cursor_shape_override`].
+//! Supported shapes are `Block`, `Beam` (vertical bar), and `Underline`:
+//!
+//! - `Block` fills the entire cell.
+//! - `Beam` and `Underline` use [`TerminalRenderer::cursor_thickness`] as a
+//!   fraction of the cell's width or height respectively.
+//!
+//! Blinking is **not** handled here: the renderer receives an already-resolved
+//! `cursor_visible` boolean from [`TerminalView`](crate::TerminalView), which
+//! owns the blink timer.
+//!
 //! # Example
 //!
 //! ```ignore
+//! use alacritty_terminal::vte::ansi::CursorShape;
 //! use gpui::px;
 //! use gpui_terminal::{ColorPalette, TerminalRenderer};
 //!
 //! let renderer = TerminalRenderer::new(
 //!     "JetBrains Mono".to_string(),
 //!     px(14.0),
-//!     1.0,  // line height multiplier
+//!     1.0,                                // line height multiplier
+//!     0.15,                               // cursor thickness (15% of cell)
 //!     ColorPalette::default(),
+//!     Some(CursorShape::Beam),            // override shape, or `None`
 //! );
 //! ```
 
@@ -68,6 +85,7 @@ use crate::backend::{
 use crate::box_drawing;
 use crate::colors::ColorPalette;
 use crate::grid::GridSource;
+use alacritty_terminal::vte::ansi::CursorShape;
 use alacritty_terminal::{
     index::Line,
     term::{
@@ -81,6 +99,11 @@ use alacritty_terminal::{
 ///
 /// This struct groups adjacent terminal cells with identical visual attributes
 /// to reduce the number of text rendering calls.
+///
+/// Runs are produced by [`TerminalRenderer::layout_row`] and consumed by the
+/// paint loop. Adjacent cells extend an existing run when every styling field
+/// matches; otherwise a new run is started, so a row can produce multiple runs
+/// when styling changes (e.g. prompt text vs. output).
 #[derive(Debug, Clone)]
 pub struct BatchedTextRun {
     /// The text content to render
@@ -111,6 +134,10 @@ pub struct BatchedTextRun {
 /// Background rectangle to paint.
 ///
 /// Represents a rectangular region with a solid color background.
+///
+/// Rects are produced by [`TerminalRenderer::layout_row`] and merged by
+/// [`TerminalRenderer::merge_backgrounds`] before painting. The end column is
+/// exclusive, so `end_col - start_col` is the width in cells.
 #[derive(Debug, Clone)]
 pub struct BackgroundRect {
     /// Starting column position
@@ -132,7 +159,10 @@ impl BackgroundRect {
     /// Two rectangles can be merged if they:
     /// - Are on the same row
     /// - Have the same color
-    /// - Are horizontally adjacent
+    /// - Are horizontally adjacent (`self.end_col == other.start_col`)
+    ///
+    /// The merge is directional (self before other); callers iterating in
+    /// left-to-right order can merge in place without checking the reverse.
     fn can_merge_with(&self, other: &Self) -> bool {
         self.row == other.row && self.color == other.color && self.end_col == other.start_col
     }
@@ -150,6 +180,14 @@ impl BackgroundRect {
 /// [`measure_cell`](Self::measure_cell). This ensures accurate character
 /// positioning regardless of the font used.
 ///
+/// # Cursor Style
+///
+/// The cursor shape is resolved as
+/// `cursor_shape_override.unwrap_or(grid.cursor().shape)`, so the override
+/// wins over what the program requests via `DECSCUSR`. `cursor_thickness`
+/// only affects `Beam` and `Underline` (a `Block` fills the cell by
+/// definition). Blinking is handled by the view, not by the renderer.
+///
 /// # Usage
 ///
 /// The renderer is typically used internally by [`TerminalView`](crate::TerminalView),
@@ -160,7 +198,7 @@ impl BackgroundRect {
 /// renderer.measure_cell(window);
 ///
 /// // Paint the terminal grid
-/// renderer.paint(bounds, padding, &term, window, cx);
+/// renderer.paint(bounds, padding, &term, None, true, false, window, cx);
 /// ```
 ///
 /// # Performance
@@ -188,36 +226,69 @@ pub struct TerminalRenderer {
 
     /// Color palette for resolving terminal colors
     pub palette: ColorPalette,
+
+    /// Thickness of `Beam` and `Underline` cursors as a fraction of the
+    /// cell's width or height respectively (e.g. `0.15` = 15%).
+    ///
+    /// Clamped to at least 1px so the cursor is always visible at small
+    /// font sizes. Has no effect on `Block` cursors.
+    pub cursor_thickness: f32,
+
+    /// Forces the cursor shape, overriding the shape reported by the grid.
+    ///
+    /// - `None` → use the shape from `grid.cursor().shape` (i.e., whatever
+    ///   the program requested via `DECSCUSR`).
+    /// - `Some(shape)` → always draw this shape, ignoring the program.
+    pub cursor_shape_override: Option<CursorShape>,
 }
 
 impl TerminalRenderer {
     /// Creates a new terminal renderer with the given font settings and color palette.
+    ///
+    /// Initial cell dimensions are approximated (`font_size * 0.6` wide,
+    /// `font_size * 1.4` tall) and will be replaced by real measurements the
+    /// first time [`measure_cell`](Self::measure_cell) runs, which happens at
+    /// the start of the first render.
     ///
     /// # Arguments
     ///
     /// * `font_family` - The name of the font family to use
     /// * `font_size` - The font size in pixels
     /// * `line_height_multiplier` - Multiplier for line height (e.g., 1.2 for 20% extra)
+    /// * `cursor_thickness` - Fraction of the cell occupied by `Beam`/`Underline`
+    ///   cursors (e.g. `0.15` for 15%). Ignored for `Block`.
     /// * `palette` - The color palette to use for terminal colors
+    /// * `cursor_shape_override` - If `Some`, forces this cursor shape and
+    ///   ignores the grid's. If `None`, the grid's shape is used.
     ///
     /// # Returns
     ///
-    /// A new `TerminalRenderer` instance with default cell dimensions.
+    /// A new `TerminalRenderer` instance with approximate cell dimensions.
     ///
     /// # Examples
     ///
     /// ```
+    /// use alacritty_terminal::vte::ansi::CursorShape;
     /// use gpui::px;
     /// use gpui_terminal::render::TerminalRenderer;
     /// use gpui_terminal::ColorPalette;
     ///
-    /// let renderer = TerminalRenderer::new("Fira Code".to_string(), px(14.0), 1.0, ColorPalette::default());
+    /// let renderer = TerminalRenderer::new(
+    ///     "Fira Code".to_string(),
+    ///     px(14.0),
+    ///     1.0,                      // line height multiplier
+    ///     0.15,                     // cursor thickness
+    ///     ColorPalette::default(),
+    ///     Some(CursorShape::Beam),  // or None to honor the program
+    /// );
     /// ```
     pub fn new(
         font_family: String,
         font_size: Pixels,
         line_height_multiplier: f32,
+        cursor_thickness: f32,
         palette: ColorPalette,
+        cursor_shape_override: Option<CursorShape>,
     ) -> Self {
         // Default cell dimensions - will be measured on first paint
         // Using 0.6 as approximate em-width ratio for monospace fonts
@@ -230,6 +301,8 @@ impl TerminalRenderer {
             cell_width,
             cell_height,
             line_height_multiplier,
+            cursor_thickness,
+            cursor_shape_override,
             palette,
         }
     }
@@ -239,6 +312,10 @@ impl TerminalRenderer {
     /// This method measures the actual width and height of characters
     /// using the GPUI text system. It uses the '│' (BOX DRAWINGS LIGHT VERTICAL)
     /// character which spans the full cell height in properly designed terminal fonts.
+    ///
+    /// Only overrides the internal dimensions if the measured values are
+    /// positive, so a font that fails to shape leaves the previous (or
+    /// initial approximate) metrics in place rather than collapsing to zero.
     ///
     /// # Arguments
     ///
@@ -287,10 +364,25 @@ impl TerminalRenderer {
     /// with identical styling into batched runs. It also collects background
     /// rectangles that need to be painted.
     ///
+    /// # Behavior
+    ///
+    /// - **Wide-character spacers** (`Flags::WIDE_CHAR_SPACER`) are skipped, so
+    ///   the preceding wide glyph occupies the pair of columns on its own.
+    /// - **NUL cells** are normalized to spaces, so empty regions still get a
+    ///   background rect and contribute to runs.
+    /// - **Colors** are resolved through [`ColorPalette::resolve`] against the
+    ///   grid's override colors (`colors`), which is where ANSI/program color
+    ///   overrides take effect.
+    /// - **Adjacent backgrounds** with the same color are extended in place,
+    ///   and the final list is passed through
+    ///   [`merge_backgrounds`](Self::merge_backgrounds) as a second pass.
+    /// - **Adjacent text runs** are extended only when *all* styling fields
+    ///   match (`fg_color`, `bg_color`, `bold`, `italic`, `underline`).
+    ///
     /// # Arguments
     ///
     /// * `row` - The row number
-    /// * `cells` - Iterator over (column, Cell) pairs
+    /// * `cells` - Iterator over `(column, Cell)` pairs
     /// * `colors` - Terminal color configuration
     ///
     /// # Returns
@@ -413,9 +505,14 @@ impl TerminalRenderer {
     /// This optimization reduces the number of rectangles to paint by
     /// combining horizontally adjacent rectangles that share the same color.
     ///
+    /// Runs in O(n) over an already-sorted-by-column list, using
+    /// [`BackgroundRect::can_merge_with`] to decide adjacency. The first rect
+    /// is consumed with `remove(0)`, so callers can pass a vector they no
+    /// longer need (as [`layout_row`](Self::layout_row) does).
+    ///
     /// # Arguments
     ///
-    /// * `rects` - Vector of background rectangles to merge
+    /// * `rects` - Vector of background rectangles to merge, in paint order
     ///
     /// # Returns
     ///
@@ -446,14 +543,55 @@ impl TerminalRenderer {
     /// This is the main rendering method that draws the terminal grid,
     /// including backgrounds, text, and cursor.
     ///
+    /// # Paint order
+    ///
+    /// 1. Default background over the full `bounds` (covers the padding area).
+    /// 2. Selection highlight, per visible line, before any text.
+    /// 3. Non-default background rectangles (batched per row).
+    /// 4. Box-drawing characters, split into two passes:
+    ///    - horizontal spans across adjacent cells (avoids 1px gaps between
+    ///      cells that would otherwise appear at arbitrary font sizes),
+    ///    - vertical components (or the full glyph, if not part of a span).
+    /// 5. Regular text characters, one shape call per cell.
+    /// 6. Cursor, if the grid reports one and it should be visible this frame.
+    ///
+    /// # Cursor visibility
+    ///
+    /// `cursor_visible` is the current phase of the blink cycle (owned by the
+    /// caller). `cursor_blink` is the **effective** blink state after applying
+    /// [`TerminalConfig::cursor_blink_override`](crate::TerminalConfig). The
+    /// cursor is painted when `cursor_visible || !cursor_blink`:
+    ///
+    /// - Non-blinking cursor (`cursor_blink == false`) → always painted.
+    /// - Blinking cursor in the "on" phase (`cursor_visible == true`) → painted.
+    /// - Blinking cursor in the "off" phase → skipped.
+    ///
+    /// The shape is resolved as `self.cursor_shape_override.unwrap_or(cursor.shape)`,
+    /// and `Beam`/`Underline` use [`cursor_thickness`](Self::cursor_thickness).
+    /// Variants other than `Block`/`Beam`/`Underline` (e.g. `Hidden`) cause the
+    /// cursor to be skipped.
+    ///
+    /// # Selection
+    ///
+    /// `selection` is a pair of grid points in buffer coordinates. They are
+    /// normalized (swapped if needed) and clamped per line so that a multi-line
+    /// selection fills the middle lines edge to edge. The highlight is painted
+    /// only for the visible rows that intersect the range.
+    ///
     /// # Arguments
     ///
     /// * `bounds` - The bounding box to render within
     /// * `padding` - Padding around the terminal content
     /// * `grid` - The cells to draw: a [`Term`](alacritty_terminal::term::Term),
     ///   or any other [`GridSource`]
+    /// * `selection` - Normalized-on-the-fly `(start, end)` grid points to
+    ///   highlight, or `None` for no selection
+    /// * `cursor_visible` - Current blink phase (`true` = cursor on this frame)
+    /// * `cursor_blink` - Effective blink state after overrides; controls
+    ///   whether `cursor_visible == false` actually hides the cursor
     /// * `window` - The GPUI window
     /// * `cx` - The application context
+    #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &self,
         bounds: Bounds<Pixels>,
@@ -463,6 +601,8 @@ impl TerminalRenderer {
             alacritty_terminal::index::Point,
             alacritty_terminal::index::Point,
         )>,
+        cursor_visible: bool,
+        cursor_blink: bool,
         window: &mut Window,
         _cx: &mut App,
     ) {
@@ -764,28 +904,57 @@ impl TerminalRenderer {
         }
 
         // Paint cursor
-        if display_offset == 0 {
-            let Some((cursor_line, cursor_column)) = grid.cursor() else {
+        if let Some(cursor) = grid.cursor() {
+            let should_paint = cursor_visible || !cursor_blink;
+
+            if !should_paint {
                 return;
+            }
+
+            let x = origin.x + self.cell_width * (cursor.column as f32);
+            let y = origin.y + self.cell_height * (cursor.line as f32);
+            let thickness = self.cursor_thickness;
+
+            let shape = self.cursor_shape_override.unwrap_or(cursor.shape);
+
+            let cursor_bounds = match shape {
+                CursorShape::Block => Bounds {
+                    origin: Point { x, y },
+                    size: Size {
+                        width: self.cell_width,
+                        height: self.cell_height,
+                    },
+                },
+                CursorShape::Beam => {
+                    let w = (self.cell_width * thickness).max(px(1.0));
+                    Bounds {
+                        origin: Point { x, y },
+                        size: Size {
+                            width: w,
+                            height: self.cell_height,
+                        },
+                    }
+                }
+                CursorShape::Underline => {
+                    let h = (self.cell_height * thickness).max(px(1.0));
+                    Bounds {
+                        origin: Point {
+                            x,
+                            y: y + self.cell_height - h,
+                        },
+                        size: Size {
+                            width: self.cell_width,
+                            height: h,
+                        },
+                    }
+                }
+                _ => return, // Hidden or variants
             };
-            let cursor_x = origin.x + self.cell_width * (cursor_column as f32);
-            let cursor_y = origin.y + self.cell_height * (cursor_line as f32);
 
             let cursor_color = self.palette.resolve(
                 Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
                 colors,
             );
-
-            let cursor_bounds = Bounds {
-                origin: Point {
-                    x: cursor_x,
-                    y: cursor_y,
-                },
-                size: Size {
-                    width: self.cell_width,
-                    height: self.cell_height,
-                },
-            };
 
             window.paint_quad(quad(
                 cursor_bounds,
@@ -809,7 +978,9 @@ mod tests {
             "Fira Code".to_string(),
             px(14.0),
             1.0,
+            0.15,
             ColorPalette::default(),
+            None,
         );
         assert_eq!(renderer.font_family, "Fira Code");
         assert_eq!(renderer.font_size, px(14.0));
@@ -852,7 +1023,9 @@ mod tests {
             "monospace".to_string(),
             px(14.0),
             1.0,
+            0.15,
             ColorPalette::default(),
+            None,
         );
         let black = Hsla::black();
 

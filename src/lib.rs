@@ -363,5 +363,5 @@ pub use render::TerminalRenderer;
 pub use terminal::TerminalState;
 pub use view::{
     BellCallback, ClipboardStoreCallback, ExitCallback, KeyHandler, ResizeCallback, TerminalConfig,
-    TerminalView, TitleCallback,
+    TerminalView, TitleCallback, CursorShape,
 };

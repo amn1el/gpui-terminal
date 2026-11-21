@@ -48,8 +48,10 @@
 //! ```
 
 use alacritty_terminal::Term;
-use alacritty_terminal::grid::Dimensions;
+pub use alacritty_terminal::vte::ansi::CursorShape;
 
+use crate::{GridSource, mouse};
+// use crate::GridSource;
 use crate::backend::{Edges, prelude::FluentBuilder, *};
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
@@ -60,11 +62,13 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 /// Configuration for terminal creation and runtime updates.
 ///
 /// This struct defines the terminal's appearance and behavior, including
-/// grid dimensions, font settings, scrollback buffer, and color scheme.
+/// grid dimensions, font settings, scrollback buffer, color scheme, and
+/// cursor style.
 ///
 /// # Default Values
 ///
@@ -72,17 +76,22 @@ use std::thread;
 /// |-------|---------|
 /// | `cols` | 80 |
 /// | `rows` | 24 |
-/// | `font_family` | "monospace" |
+/// | `font_family` | `"monospace"` |
 /// | `font_size` | 14px |
 /// | `scrollback` | 10000 |
 /// | `line_height_multiplier` | 1.0 |
 /// | `padding` | 0px all sides |
 /// | `colors` | Default palette |
-/// | `copy_on_selection` | false |
+/// | `copy_on_select` | false |
+/// | `cursor_blink_override` | `None` (respect the program) |
+/// | `cursor_blink_ms` | 500 |
+/// | `cursor_thickness` | 0.15 |
+/// | `cursor_shape_override` | `None` (respect the program) |
 ///
 /// # Example
 ///
 /// ```ignore
+/// use alacritty_terminal::vte::ansi::CursorShape;
 /// use gpui::{Edges, px};
 /// use gpui_terminal::{ColorPalette, TerminalConfig};
 ///
@@ -91,16 +100,37 @@ use std::thread;
 ///     rows: 40,
 ///     font_family: "JetBrains Mono".into(),
 ///     font_size: px(13.0),
-///     scrollback: 50000,
+///     scrollback: 50_000,
 ///     line_height_multiplier: 1.0,
-///     copy_on_selection: true,
 ///     padding: Edges::all(px(10.0)),
 ///     colors: ColorPalette::builder()
 ///         .background(0x1a, 0x1a, 0x1a)
 ///         .foreground(0xe0, 0xe0, 0xe0)
 ///         .build(),
+///     copy_on_select: true,
+///     cursor_blink_override: Some(true),
+///     cursor_blink_ms: 500,
+///     cursor_thickness: 0.15,
+///     cursor_shape_override: Some(CursorShape::Beam),
 /// };
 /// ```
+///
+/// # Cursor Overrides
+///
+/// Programs can request a cursor shape and blink state through the
+/// `DECSCUSR` escape sequence (`CSI Ps SP q`). The `*_override` fields
+/// let the host application ignore those requests and enforce a style
+/// of its own:
+///
+/// - `Some(value)` → always use this value, regardless of what the
+///   program requests.
+/// - `None` → honor the grid's cursor state (see
+///   [`GridSource::cursor`](crate::grid::GridSource::cursor)).
+///
+/// `cursor_thickness` only affects `Beam` and `Underline` cursors: a
+/// `Block` cursor fills the entire cell by definition. The value is a
+/// fraction of the cell's width (for `Beam`) or height (for
+/// `Underline`), so `0.15` means 15%.
 ///
 /// # Runtime Updates
 ///
@@ -131,12 +161,12 @@ pub struct TerminalConfig {
     /// Maximum number of scrollback lines to keep in history
     pub scrollback: usize,
 
-    /// Multiplier for line height to accommodate tall glyphs (e.g., nerd fonts)
-    /// Default is 1.0 (no extra height)
+    /// Multiplier for line height to accommodate tall glyphs (e.g., nerd fonts).
+    /// Default is 1.0 (no extra height).
     pub line_height_multiplier: f32,
 
-    /// Padding around the terminal content (top, right, bottom, left)
-    /// The padding area renders with the terminal's background color
+    /// Padding around the terminal content (top, right, bottom, left).
+    /// The padding area renders with the terminal's background color.
     pub padding: Edges<Pixels>,
 
     /// Color palette for terminal colors (16 ANSI colors, 256 extended colors,
@@ -145,8 +175,41 @@ pub struct TerminalConfig {
 
     /// Copy to clipboard on text selection
     pub copy_on_select: bool,
+
+    /// Forces the cursor to blink (or not), ignoring what the program
+    /// requests via `DECSCUSR`.
+    ///
+    /// - `None` → honor the cursor state reported by
+    ///   [`GridSource::cursor`](crate::grid::GridSource::cursor).
+    /// - `Some(true)` → always blink.
+    /// - `Some(false)` → never blink.
+    pub cursor_blink_override: Option<bool>,
+
+    /// Interval, in milliseconds, between cursor blink phases.
+    /// Ignored when the effective blink state is `false`.
+    pub cursor_blink_ms: u64,
+
+    /// Thickness of `Beam` and `Underline` cursors as a fraction of the
+    /// cell's width or height respectively (e.g. `0.15` = 15%).
+    ///
+    /// Has no effect on `Block` cursors, which fill the entire cell.
+    pub cursor_thickness: f32,
+
+    /// Forces the cursor shape, ignoring what the program requests via
+    /// `DECSCUSR`.
+    ///
+    /// - `None` → honor the shape reported by
+    ///   [`GridSource::cursor`](crate::grid::GridSource::cursor).
+    /// - `Some(shape)` → always draw this shape (`Block`, `Beam`,
+    ///   `Underline`, …).
+    pub cursor_shape_override: Option<CursorShape>,
 }
 
+/// Provides the documented defaults listed on [`TerminalConfig`].
+///
+/// Notably, both cursor overrides default to `None`, so programs that emit
+/// `DECSCUSR` keep full control of the cursor unless the host application
+/// opts in by setting an override.
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
@@ -159,6 +222,10 @@ impl Default for TerminalConfig {
             padding: Edges::all(px(0.0)),
             colors: ColorPalette::default(),
             copy_on_select: false,
+            cursor_blink_override: None,
+            cursor_blink_ms: 500,
+            cursor_thickness: 0.15,
+            cursor_shape_override: None,
         }
     }
 }
@@ -343,15 +410,20 @@ pub type ExitCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 /// The main terminal view component for GPUI applications.
 ///
 /// `TerminalView` is a GPUI entity that implements the [`Render`] trait,
-/// providing a complete terminal emulator that can be embedded in any GPUI application.
+/// providing a complete terminal emulator that can be embedded in any GPUI
+/// application.
 ///
 /// # Responsibilities
 ///
-/// - **Terminal State**: Manages the grid, cursor, and colors via [`TerminalState`]
-/// - **I/O Streams**: Reads from PTY stdout and writes to PTY stdin
-/// - **Event Handling**: Processes keyboard, mouse, and resize events
-/// - **Rendering**: Paints text, backgrounds, and cursor via [`TerminalRenderer`]
-/// - **Callbacks**: Dispatches events to user-provided callbacks
+/// - **Terminal State**: Manages the grid, cursor, and colors via
+///   [`TerminalState`].
+/// - **I/O Streams**: Reads from PTY stdout and writes to PTY stdin.
+/// - **Event Handling**: Processes keyboard, mouse, and resize events.
+/// - **Rendering**: Paints text, backgrounds, and cursor via
+///   [`TerminalRenderer`].
+/// - **Cursor Animation**: Drives the cursor blink timer when the effective
+///   cursor style requests it (see [Cursor Blinking](#cursor-blinking)).
+/// - **Callbacks**: Dispatches events to user-provided callbacks.
 ///
 /// # Creating a Terminal
 ///
@@ -382,12 +454,41 @@ pub type ExitCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 /// - [`with_key_handler`](Self::with_key_handler) - Key event interception
 /// - [`with_bell_callback`](Self::with_bell_callback) - Terminal bell
 /// - [`with_title_callback`](Self::with_title_callback) - Title changes
-/// - [`with_clipboard_store_callback`](Self::with_clipboard_store_callback) - Clipboard writes
+/// - [`with_clipboard_store_callback`](Self::with_clipboard_store_callback) -
+///   Clipboard writes
+///
+/// # Cursor Blinking
+///
+/// Blinking is driven by a per-view timer rather than the renderer, because
+/// it needs to toggle state and repaint the view on an interval. The view
+/// keeps three pieces of state for this:
+///
+/// - `cursor_visible`: the current phase (`true` = cursor painted this frame).
+/// - `blink_task`: the background task currently running the blink loop, if
+///   any.
+/// - `blink_epoch`: a generation counter. Every time the loop is restarted
+///   (e.g. because the user typed, or the effective blink state changed) the
+///   epoch is bumped, and any in-flight task whose epoch no longer matches
+///   exits on its next tick. This avoids the classic "task drops itself from
+///   inside itself" bug and makes cancellation race-free.
+///
+/// The **effective** blink state is resolved as:
+///
+/// ```text
+/// config.cursor_blink_override.unwrap_or(grid.cursor().blink)
+/// ```
+///
+/// so a host application can force blinking on or off regardless of what the
+/// program requests via `DECSCUSR`. The same resolved state is what gets passed
+/// to [`TerminalRenderer::paint`], ensuring the renderer's hide/show decision
+/// matches the timer's phase. Reading `grid.cursor().blink` directly in
+/// `paint` would ignore the override and break blinking.
 ///
 /// # Thread Safety
 ///
 /// `TerminalView` is not `Send` as it contains GPUI handles. The stdin writer
-/// is internally wrapped in `Arc<parking_lot::Mutex<>>` for safe concurrent access.
+/// is internally wrapped in `Arc<parking_lot::Mutex<>>` for safe concurrent
+/// access.
 pub struct TerminalView {
     /// The terminal state managing the grid and VTE parser
     state: TerminalState,
@@ -404,7 +505,11 @@ pub struct TerminalView {
     /// Receiver for terminal events from the event proxy
     event_rx: mpsc::Receiver<TerminalEvent>,
 
-    /// Configuration used to create this terminal
+    /// Configuration used to create this terminal.
+    ///
+    /// Mutated through [`update_config`](Self::update_config); the cursor
+    /// `*_override` fields are re-read on every render, so changing them takes
+    /// effect immediately without restarting the blink task.
     config: TerminalConfig,
 
     /// Async task that reads bytes and notifies the view (push-based)
@@ -432,14 +537,51 @@ pub struct TerminalView {
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
 
-    /// Scroll accumulator up/down
+    /// Fractional scroll offset accumulated from wheel/trackpad events.
+    ///
+    /// Wheel deltas arrive in fractional units; whole lines are extracted from
+    /// this accumulator and applied to the grid's `display_offset`, while the
+    /// remainder carries over to the next event. This keeps scrolling smooth
+    /// on high-resolution trackpads, where a single "notch" may span several
+    /// frames.
     scroll_accumulator: f32,
 
-    /// Start selection
-    selection_start: Option<alacritty_terminal::index::Point>,
+    /// Current text selection, or `None` when nothing is selected.
+    ///
+    /// Replaces the previous `selection_start` / `selection_end` pair.
+    /// The [`SelectionType`] distinguishes single-click (Simple),
+    /// double-click (Word), and triple-click (Line) selections, and is
+    /// preserved across drags. Endpoints are stored in buffer coordinates
+    /// (negative lines reach into the scrollback).
+    selection: Option<mouse::Selection>,
 
-    /// End selection
-    selection_end: Option<alacritty_terminal::index::Point>,
+    /// Current phase of the cursor blink cycle.
+    ///
+    /// `true` means the cursor is painted this frame. Toggled by
+    /// [`blink_task`](Self::blink_task) when the effective cursor style
+    /// requests blinking; forced back to `true` whenever the user types, so
+    /// the cursor is always visible while input is happening. Passed to
+    /// [`TerminalRenderer::paint`] to gate the actual draw.
+    cursor_visible: bool,
+
+    /// Background task driving the cursor blink loop, if one is running.
+    ///
+    /// Set by [`sync_blink`](Self::sync_blink) when the effective cursor
+    /// style requests blinking; left as `None` otherwise. The task never
+    /// clears this field from within itself — instead it checks
+    /// [`blink_epoch`](Self::blink_epoch) on every tick and exits if it has
+    /// been superseded. External code (key handlers, `sync_blink`) sets this
+    /// to `None` to cancel the loop, after bumping the epoch.
+    blink_task: Option<Task<()>>,
+
+    /// Generation counter for the cursor blink loop.
+    ///
+    /// Incremented every time [`sync_blink`](Self::sync_blink) starts a new
+    /// loop (or cancels the current one). A running task captures the epoch
+    /// it was spawned with and exits on its next tick if `blink_epoch` no
+    /// longer matches. This makes restarts race-free without needing to drop
+    /// the task from inside itself.
+    blink_epoch: usize,
 }
 
 impl TerminalView {
@@ -495,7 +637,9 @@ impl TerminalView {
             config.font_family.clone(),
             config.font_size,
             config.line_height_multiplier,
+            config.cursor_thickness,
             config.colors.clone(),
+            config.cursor_shape_override,
         );
 
         // Create focus handle
@@ -559,12 +703,14 @@ impl TerminalView {
             key_handler: None,
             bell_callback: None,
             title_callback: None,
-            selection_start: None,
-            selection_end: None,
+            selection: None,
             clipboard_store_callback: None,
             clipboard_load_callback: None,
             exit_callback: None,
-            scroll_accumulator: 0.,
+            scroll_accumulator: 0.0,
+            cursor_visible: true,
+            blink_task: None,
+            blink_epoch: 0,
         }
     }
 
@@ -696,7 +842,7 @@ impl TerminalView {
     /// terminal.with_clipboard_load_callback(|window, cx| {
     ///     // Option 1: Use the gpui clipboard
     ///     cx.read_from_clipboard().and_then(|item| item.text())
-    ///     
+    ///
     ///     // Option 2: Always deny for safety
     ///     // None
     /// })
@@ -739,6 +885,11 @@ impl TerminalView {
     /// from the stdout reader and sending them through the async channel.
     /// The async channel allows the main async task to be woken up immediately
     /// when data arrives (push-based).
+    ///
+    /// Reads in 4 KiB chunks. Returns (and therefore closes the channel) on
+    /// EOF, on a read error, or when the receiver has been dropped — the async
+    /// side treats the channel closing as "PTY finished" and emits
+    /// [`TerminalEvent::Exit`].
     fn read_stdout_blocking<R: Read + Send + 'static>(
         mut stdout_reader: R,
         bytes_tx: flume::Sender<Vec<u8>>,
@@ -771,21 +922,33 @@ impl TerminalView {
     /// Converts GPUI keystrokes to terminal escape sequences and writes them
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
+    ///
+    /// # Dispatch order
+    ///
+    /// 1. **Ctrl+C with a selection**: copies the selection to the clipboard
+    ///    and, unless Shift is held, clears it and swallows the event.
+    /// 2. **Shift+Arrow keys**: extend the current selection instead of
+    ///    sending cursor-movement sequences to the PTY.
+    /// 3. **`key_handler` callback**: if it returns `true`, the event is
+    ///    considered consumed and no bytes are sent.
+    /// 4. **Default path**: translate the keystroke to bytes via
+    ///    [`keystroke_to_bytes`], write them to the PTY, drop any existing
+    ///    selection, scroll the view back to the bottom, and restart the
+    ///    blink cycle so the cursor is visible while typing.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let mode = self.state.mode();
 
         let is_ctrl_c = keystroke.key == "c" && keystroke.modifiers.control;
         if is_ctrl_c {
-            if let (Some(start), Some(end)) = (self.selection_start, self.selection_end)
-                && start != end
+            if let Some(sel) = self.selection.clone()
+                && sel.start != sel.end
             {
                 let text = self.get_selected_text();
                 if !text.is_empty() {
                     self.copy_to_clipboard(text, window, cx);
                     if !keystroke.modifiers.shift {
-                        self.selection_start = None;
-                        self.selection_end = None;
+                        self.selection = None;
                         cx.notify();
                         return;
                     }
@@ -801,22 +964,24 @@ impl TerminalView {
             && matches!(keystroke.key.as_str(), "up" | "down" | "left" | "right")
         {
             self.state.with_term_mut(|term| {
-                if self.selection_start.is_none() {
+                if self.selection.is_none() {
                     let cursor = term.grid().cursor.point;
-                    self.selection_start = Some(cursor);
-                    self.selection_end = Some(cursor);
+                    self.selection = Some(mouse::Selection::new(
+                        cursor,
+                        cursor,
+                        mouse::SelectionType::Simple,
+                    ));
                 }
 
-                if let Some(mut end) = self.selection_end {
+                if let Some(sel) = self.selection.as_mut() {
+                    let mut end = sel.end;
                     match keystroke.key.as_str() {
                         "up" => {
-                            let new_line =
-                                (end.line.0 - 1).max(-(term.grid().display_offset() as i32));
+                            let new_line = (end.line.0 - 1).max(-(term.display_offset() as i32));
                             end.line = alacritty_terminal::index::Line(new_line);
                         }
                         "down" => {
-                            let new_line =
-                                (end.line.0 + 1).min(term.grid().screen_lines() as i32 - 1);
+                            let new_line = (end.line.0 + 1).min(term.screen_lines() as i32 - 1);
                             end.line = alacritty_terminal::index::Line(new_line);
                         }
                         "left" => {
@@ -830,7 +995,7 @@ impl TerminalView {
                         }
                         _ => unreachable!(),
                     }
-                    self.selection_end = Some(end);
+                    sel.end = end;
                 }
             });
 
@@ -849,9 +1014,8 @@ impl TerminalView {
             let _ = writer.write_all(&bytes);
             let _ = writer.flush();
 
-            if self.selection_start.is_some() {
-                self.selection_start = None;
-                self.selection_end = None;
+            if self.selection.is_some() {
+                self.selection = None;
             }
 
             self.state.with_term_mut(|term| {
@@ -860,13 +1024,28 @@ impl TerminalView {
                     self.scroll_accumulator = 0.0;
                 }
             });
+
+            self.cursor_visible = true;
+            self.blink_task = None;
+            self.blink_epoch += 1;
+
             cx.notify();
         }
     }
 
-    /// Handle mouse down events.
+    /// Handle mouse-down events.
     ///
-    /// Currently a placeholder for future mouse selection and interaction support.
+    /// Behavior depends on the terminal mode reported by the program:
+    ///
+    /// - **Double-click** (`click_count == 2`): select the word under the
+    ///   cursor by expanding left/right until whitespace is hit.
+    /// - **Mouse reporting active** (`MOUSE_REPORT_CLICK` or `MOUSE_MOTION`):
+    ///   forward the event to the PTY as a `SGR` or legacy `X10` mouse
+    ///   report, so programs like vim, tmux, or htop can handle it.
+    /// - **Otherwise**: start a new text selection at the clicked cell.
+    ///
+    /// The terminal is also focused by this handler so subsequent key events
+    /// are delivered to it.
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -879,7 +1058,37 @@ impl TerminalView {
         #[cfg(feature = "gpui-kit")]
         window.focus(&self.focus_handle, cx);
 
-        if event.click_count == 2 {
+        let selection_type = mouse::selection_type_from_clicks(event.click_count);
+        let mode = self.state.mode();
+
+        if selection_type == mouse::SelectionType::Line {
+            self.state.with_term_mut(|term| {
+                let point = point_to_cell(
+                    self.config.padding,
+                    self.renderer.cell_width,
+                    self.renderer.cell_height,
+                    event.position,
+                    term,
+                );
+                let start = alacritty_terminal::index::Point::new(
+                    point.line,
+                    alacritty_terminal::index::Column(0),
+                );
+                let end = alacritty_terminal::index::Point::new(
+                    point.line,
+                    alacritty_terminal::index::Column(term.columns().saturating_sub(1)),
+                );
+                self.selection = Some(mouse::Selection::new(
+                    start,
+                    end,
+                    mouse::SelectionType::Line,
+                ));
+            });
+            cx.notify();
+            return;
+        }
+
+        if selection_type == mouse::SelectionType::Word {
             self.state.with_term_mut(|term| {
                 let point = point_to_cell(
                     self.config.padding,
@@ -891,11 +1100,8 @@ impl TerminalView {
 
                 let mut start = point;
                 while start.column.0 > 0 {
-                    let prev_cell = &term.grid()[alacritty_terminal::index::Point::new(
-                        start.line,
-                        alacritty_terminal::index::Column(start.column.0 - 1),
-                    )];
-                    if prev_cell.c.is_whitespace() {
+                    let prev = &term.cell(start.line.0 as usize, start.column.0 - 1);
+                    if prev.c.is_whitespace() {
                         break;
                     }
                     start.column.0 -= 1;
@@ -903,52 +1109,65 @@ impl TerminalView {
 
                 let mut end = point;
                 while end.column.0 < term.columns() - 1 {
-                    let next_cell = &term.grid()[alacritty_terminal::index::Point::new(
-                        end.line,
-                        alacritty_terminal::index::Column(end.column.0 + 1),
-                    )];
-                    if next_cell.c.is_whitespace() {
+                    let next = term.cell(end.line.0 as usize, end.column.0 + 1);
+                    if next.c.is_whitespace() {
                         break;
                     }
                     end.column.0 += 1;
                 }
 
-                self.selection_start = Some(start);
-                self.selection_end = Some(end);
+                self.selection = Some(mouse::Selection::new(
+                    start,
+                    end,
+                    mouse::SelectionType::Word,
+                ));
             });
             cx.notify();
             return;
         }
 
-        let mode = self.state.mode();
         if mode.intersects(
             alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
                 | alacritty_terminal::term::TermMode::MOUSE_MOTION,
-        ) {
+        ) && mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE)
+        {
             self.state.with_term_mut(|term| {
-                let point = point_to_cell(
+                let buffer_point = point_to_cell(
                     self.config.padding,
                     self.renderer.cell_width,
                     self.renderer.cell_height,
                     event.position,
                     term,
                 );
-                let col = point.column.0 + 1;
-                let line = point.line.0 + 1;
+                // Mouse reports use *screen* coordinates (0-based from the top
+                // of the visible area), not buffer coordinates.
+                let screen_line = buffer_point.line.0 + term.grid().display_offset() as i32;
+                let screen_point = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(screen_line),
+                    buffer_point.column,
+                );
 
-                if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
-                    // \x1b[<0;{col};{line}M  (0 = Left buttom)
-                    let seq = format!("\x1b[<0;{};{}M", col, line);
+                let modifiers = mouse::encode_modifiers(
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.control,
+                );
+                if let Some(bytes) = mouse::mouse_button_report(
+                    MouseButton::Left,
+                    true,
+                    screen_point,
+                    modifiers,
+                    mode,
+                ) {
                     let mut writer = self.stdin_writer.lock();
-                    let _ = writer.write_all(seq.as_bytes());
+                    let _ = writer.write_all(&bytes);
                     let _ = writer.flush();
-                } else {
-                    // Mode X10 legacy
                 }
             });
             return;
         }
 
+        // Simple selection: start at the clicked cell.
         self.state.with_term_mut(|term| {
             let point = point_to_cell(
                 self.config.padding,
@@ -957,59 +1176,87 @@ impl TerminalView {
                 event.position,
                 term,
             );
-            self.selection_start = Some(point);
-            self.selection_end = Some(point);
+            self.selection = Some(mouse::Selection::new(
+                point,
+                point,
+                mouse::SelectionType::Simple,
+            ));
         });
-
         cx.notify();
     }
 
-    /// Handle mouse up events.
+    /// Handle mouse-up events.
     ///
-    /// Currently a placeholder for future mouse selection support.
+    /// Two paths, mirroring [`Self::on_mouse_down`]:
+    ///
+    /// - If the program enabled mouse reporting (`MOUSE_REPORT_CLICK`), the
+    ///   release is forwarded as an `SGR` mouse report (`…m` instead of `…M`).
+    /// - Otherwise, if a selection was in progress and `copy_on_select` is
+    ///   enabled in the config, the selected text is copied to the clipboard
+    ///   and the selection is cleared.
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let mode = self.state.mode();
 
-        if mode.intersects(alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK) {
+        if mode.contains(alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK)
+            && mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE)
+        {
             self.state.with_term_mut(|term| {
-                let point = point_to_cell(
+                let buffer_point = point_to_cell(
                     self.config.padding,
                     self.renderer.cell_width,
                     self.renderer.cell_height,
                     event.position,
                     term,
                 );
-                let col = point.column.0 + 1;
-                let line = point.line.0 + 1;
+                let screen_line = buffer_point.line.0 + term.grid().display_offset() as i32;
+                let screen_point = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(screen_line),
+                    buffer_point.column,
+                );
 
-                if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
-                    let seq = format!("\x1b[<0;{};{}m", col, line);
+                let modifiers = mouse::encode_modifiers(
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.control,
+                );
+                if let Some(bytes) = mouse::mouse_button_report(
+                    MouseButton::Left,
+                    false,
+                    screen_point,
+                    modifiers,
+                    mode,
+                ) {
                     let mut writer = self.stdin_writer.lock();
-                    let _ = writer.write_all(seq.as_bytes());
+                    let _ = writer.write_all(&bytes);
                     let _ = writer.flush();
                 }
             });
             return;
         }
 
-        if let (Some(start), Some(end)) = (self.selection_start, self.selection_end)
-            && start != end
+        if let Some(sel) = &self.selection
+            && sel.start != sel.end
         {
             let selected_text = self.get_selected_text();
-
             if self.config.copy_on_select && !selected_text.is_empty() {
                 self.copy_to_clipboard(selected_text, window, cx);
-                self.selection_start = None;
-                self.selection_end = None;
+                self.selection = None;
             }
         }
 
         cx.notify();
     }
 
-    /// Handle mouse move events.
+    /// Handle mouse-move events.
     ///
-    /// Currently a placeholder for future mouse selection support.
+    /// Two paths:
+    ///
+    /// - If the program enabled **mouse motion reporting** and the left button
+    ///   is held, the drag is forwarded as an `SGR` drag report
+    ///   (`\x1b[<32;{col};{line}M`).
+    /// - Otherwise, if a selection was started with [`Self::on_mouse_down`],
+    ///   the selection end is updated to the cell under the pointer, so the
+    ///   renderer redraws the highlight on the next frame.
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -1020,7 +1267,43 @@ impl TerminalView {
 
         if mode.contains(alacritty_terminal::term::TermMode::MOUSE_MOTION)
             && event.pressed_button == Some(MouseButton::Left)
+            && mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE)
         {
+            self.state.with_term_mut(|term| {
+                let buffer_point = point_to_cell(
+                    self.config.padding,
+                    self.renderer.cell_width,
+                    self.renderer.cell_height,
+                    event.position,
+                    term,
+                );
+                let screen_line = buffer_point.line.0 + term.grid().display_offset() as i32;
+                let screen_point = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(screen_line),
+                    buffer_point.column,
+                );
+
+                let modifiers = mouse::encode_modifiers(
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.control,
+                );
+                // Motion report: button bits are 32 (no button) | modifiers.
+                let button_value = 32u8 | modifiers;
+                let seq = format!(
+                    "\x1b[<{};{};{}M",
+                    button_value,
+                    screen_point.column.0 + 1,
+                    screen_point.line.0 + 1
+                );
+                let mut writer = self.stdin_writer.lock();
+                let _ = writer.write_all(seq.as_bytes());
+                let _ = writer.flush();
+            });
+            return;
+        }
+
+        if self.selection.is_some() && event.pressed_button == Some(MouseButton::Left) {
             self.state.with_term_mut(|term| {
                 let point = point_to_cell(
                     self.config.padding,
@@ -1029,86 +1312,174 @@ impl TerminalView {
                     event.position,
                     term,
                 );
-                let col = point.column.0 + 1;
-                let line = point.line.0 + 1;
-
-                if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
-                    let seq = format!("\x1b[<32;{};{}M", col, line);
-                    let mut writer = self.stdin_writer.lock();
-                    let _ = writer.write_all(seq.as_bytes());
-                    let _ = writer.flush();
+                if let Some(sel) = self.selection.as_mut() {
+                    if sel.selection_type == mouse::SelectionType::Line {
+                        // Line selection: keep full lines between anchor and pointer.
+                        let start_line = sel.start.line.min(point.line);
+                        let end_line = sel.start.line.max(point.line);
+                        sel.start = alacritty_terminal::index::Point::new(
+                            start_line,
+                            alacritty_terminal::index::Column(0),
+                        );
+                        sel.end = alacritty_terminal::index::Point::new(
+                            end_line,
+                            alacritty_terminal::index::Column(term.columns().saturating_sub(1)),
+                        );
+                    } else {
+                        sel.end = point;
+                    }
                 }
             });
-            return;
-        }
-
-        if self.selection_start.is_some() && event.pressed_button == Some(MouseButton::Left) {
-            self.state.with_term_mut(|term| {
-                self.selection_end = Some(point_to_cell(
-                    self.config.padding,
-                    self.renderer.cell_width,
-                    self.renderer.cell_height,
-                    event.position,
-                    term,
-                ));
-            });
-            cx.notify(); // force
+            cx.notify();
         }
     }
 
     /// Handle scroll events.
     ///
-    /// Currently a placeholder for future scrollback support.
+    /// Deltas are accumulated in [`scroll_accumulator`](Self::scroll_accumulator)
+    /// so fractional trackpad deltas translate into whole lines. Whole lines
+    /// are then dispatched via [`scroll_report`](crate::mouse::scroll_report):
+    ///
+    /// - **Mouse mode**: SGR wheel report (`button 64` up / `65` down).
+    /// - **Alt-screen without mouse**: `Up`/`Down` arrow keys (with the
+    ///   correct `APP_CURSOR` variant).
+    /// - **Normal screen without mouse**: `scroll_report` returns `None`, and
+    ///   we scroll the local display via `Term::scroll_display` (scrollback).
     fn on_scroll(&mut self, delta: f32, _window: &mut Window, cx: &mut Context<Self>) {
-        // TODO: Implement scrollback
-        // - Send scroll reports if alternate screen is not active (missing tests)
-
         let mode = self.state.mode();
 
-        if mode.contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
-            let lines = delta as i32;
-            if lines != 0 {
-                let bytes = if lines > 0 {
-                    b"\x1b[B".repeat(lines as usize)
-                } else {
-                    b"\x1b[A".repeat((-lines) as usize)
-                };
-
-                let mut writer = self.stdin_writer.lock();
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
-            }
-        } else {
-            self.scroll_accumulator += delta;
-            let lines_to_scroll = self.scroll_accumulator.trunc() as i32;
-
-            if lines_to_scroll != 0 {
-                self.scroll_accumulator -= lines_to_scroll as f32;
-
-                self.state.with_term_mut(|term| {
-                    term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines_to_scroll));
-                });
-
-                cx.notify();
-            }
+        self.scroll_accumulator += delta;
+        let lines_to_scroll = self.scroll_accumulator.trunc() as i32;
+        if lines_to_scroll == 0 {
+            return;
         }
-    }
+        self.scroll_accumulator -= lines_to_scroll as f32;
 
+        // Try to report to the program (mouse mode or alt-screen).
+        if let Some(bytes) = mouse::scroll_report(
+            lines_to_scroll,
+            alacritty_terminal::index::Point::new(
+                alacritty_terminal::index::Line(0),
+                alacritty_terminal::index::Column(0),
+            ),
+            0,
+            mode,
+        ) {
+            let mut writer = self.stdin_writer.lock();
+            let _ = writer.write_all(&bytes);
+            let _ = writer.flush();
+            return;
+        }
+
+        // Otherwise, scroll the local display (scrollback).
+        self.state.with_term_mut(|term| {
+            term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines_to_scroll));
+        });
+        cx.notify();
+    }
+    /// Copy text to the system clipboard.
+    ///
+    /// Dispatches to the user-provided
+    /// [`clipboard_store_callback`](Self::with_clipboard_store_callback). If
+    /// no callback is set, this is a no-op: the crate does not depend on a
+    /// specific clipboard implementation.
     fn copy_to_clipboard(&self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ref callback) = self.clipboard_store_callback {
             callback(window, cx, &text);
         }
     }
 
+    /// Start or stop the cursor blink loop to match `blink`.
+    ///
+    /// `blink` is the **effective** blink state, already resolved through
+    /// [`TerminalConfig::cursor_blink_override`] in [`Render::render`]; this
+    /// function never reads the grid directly.
+    ///
+    /// # Cancellation model
+    ///
+    /// This function is the *only* place that is allowed to set
+    /// [`blink_task`](Self::blink_task) to `None` (besides the key handler).
+    /// The task itself never clears the field: it checks
+    /// [`blink_epoch`](Self::blink_epoch) on every tick and exits when its
+    /// captured epoch no longer matches the current one. That is what makes
+    /// restarts race-free and avoids dropping the task from inside itself.
+    ///
+    /// # Transitions
+    ///
+    /// - `false → any`: if a task was running, bump the epoch (invalidating it
+    ///   on its next tick), clear [`blink_task`](Self::blink_task), and force
+    ///   [`cursor_visible`](Self::cursor_visible) back to `true` so a
+    ///   non-blinking cursor is always shown.
+    /// - `true → already running`: no-op; the existing loop keeps ticking.
+    /// - `true → not running`: spawn a new loop that toggles
+    ///   [`cursor_visible`](Self::cursor_visible) every
+    ///   [`TerminalConfig::cursor_blink_ms`] milliseconds and calls
+    ///   `cx.notify()` so the view repaints.
+    fn sync_blink(&mut self, blink: bool, cx: &mut Context<Self>) {
+        if !blink {
+            if self.blink_task.is_some() {
+                self.blink_epoch += 1;
+                self.blink_task = None;
+                self.cursor_visible = true;
+                cx.notify();
+            }
+            return;
+        }
+
+        if self.blink_task.is_some() {
+            return;
+        }
+
+        self.blink_epoch += 1;
+        let epoch = self.blink_epoch;
+        let interval = self.config.cursor_blink_ms;
+
+        self.blink_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(interval))
+                    .await;
+
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if this.blink_epoch != epoch {
+                            return false;
+                        }
+                        this.cursor_visible = !this.cursor_visible;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+
+                if !alive {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Extract the current selection as a plain string.
+    ///
+    /// The endpoints are normalized (swapped if needed so `start <= end`),
+    /// then each buffer line in the range is copied cell by cell. Trailing
+    /// whitespace per line is trimmed and lines are joined with `\n`.
+    ///
+    /// Selection endpoints are stored in **buffer** coordinates (negative
+    /// lines reach into the scrollback), but [`GridSource::cell`] expects
+    /// **visible** rows, so each iteration adds the display offset back:
+    /// `visible = buffer + offset`. Without this conversion, selections that
+    /// reach into scrollback would index with a wrapped `usize` and either
+    /// panic or return the wrong cell.
     fn get_selected_text(&self) -> String {
         let mut text = String::new();
-        if let (Some(mut start), Some(mut end)) = (self.selection_start, self.selection_end) {
+        if let Some(sel) = &self.selection {
+            let (mut start, mut end) = (sel.start, sel.end);
             if start > end {
                 std::mem::swap(&mut start, &mut end);
             }
 
             self.state.with_term_mut(|term| {
-                let grid = term.grid();
+                let offset = term.grid().display_offset() as i32;
                 for line_idx in start.line.0..=end.line.0 {
                     let line = alacritty_terminal::index::Line(line_idx);
 
@@ -1120,23 +1491,20 @@ impl TerminalView {
                     let end_col = if line == end.line {
                         end.column.0
                     } else {
-                        grid.columns() - 1
+                        term.columns() - 1
                     };
 
                     let mut line_str = String::new();
+                    // Convert buffer line → visible line before querying.
+                    let visible_line = (line_idx + offset) as usize;
                     for col_idx in start_col..=end_col {
-                        let cell = &grid[alacritty_terminal::index::Point::new(
-                            line,
-                            alacritty_terminal::index::Column(col_idx),
-                        )];
+                        let cell = term.cell(visible_line, col_idx);
                         if cell.c != '\0' {
                             line_str.push(cell.c);
                         }
                     }
 
                     text.push_str(line_str.trim_end());
-
-                    // add line
                     if line != end.line {
                         text.push('\n');
                     }
@@ -1151,6 +1519,14 @@ impl TerminalView {
     /// This method drains all available events from the event receiver
     /// and handles them appropriately. Note: bytes are processed in the
     /// async reader task, not here.
+    ///
+    /// Handled events:
+    ///
+    /// - `Wakeup`: already covered by the reader task, no-op here.
+    /// - `Bell`, `Title`, `ClipboardStore`, `ClipboardLoad`, `Exit`: dispatched
+    ///   to the corresponding user-provided callback if one was configured.
+    /// - `PtyWrite`: written straight to the PTY stdin (used by alacritty for
+    ///   responses to terminal queries, e.g. DA, DS R).
     fn process_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Process terminal events (from alacritty event proxy)
         while let Ok(event) = self.event_rx.try_recv() {
@@ -1242,6 +1618,16 @@ impl TerminalView {
     /// This method updates the terminal's configuration, including font settings,
     /// padding, and color palette. Changes take effect on the next render.
     ///
+    /// The renderer's cached font settings (`font_family`, `font_size`,
+    /// `line_height_multiplier`, `cursor_thickness`, `palette`,
+    /// `cursor_shape_override`) are updated eagerly; cell metrics are
+    /// recalculated on the next frame via `TerminalRenderer::measure_cell`.
+    ///
+    /// Cursor blink settings (`cursor_blink_override`, `cursor_blink_ms`) are
+    /// **not** applied here — they are read from `self.config` on every render,
+    /// so updating them takes effect on the next frame without restarting the
+    /// blink task.
+    ///
     /// # Arguments
     ///
     /// * `config` - The new configuration to apply
@@ -1263,6 +1649,18 @@ impl TerminalView {
     /// Calculate terminal dimensions from pixel bounds and cell size.
     ///
     /// Helper method to determine how many columns and rows fit in the given bounds.
+    /// Uses the currently measured cell size (from `TerminalRenderer`); callers
+    /// should ensure `measure_cell` has run at least once (the first `render`
+    /// call does).
+    ///
+    /// # Arguments
+    ///
+    /// * `bounds` - Pixel bounds to fit the grid into
+    ///
+    /// # Returns
+    ///
+    /// `(cols, rows)`, both clamped to at least 1 so the grid never becomes
+    /// degenerate.
     #[allow(dead_code)]
     fn calculate_dimensions(&self, bounds: Bounds<Pixels>) -> (usize, usize) {
         let width_f32: f32 = bounds.size.width.into();
@@ -1276,6 +1674,26 @@ impl TerminalView {
     }
 }
 
+/// Renders the terminal into the GPUI element tree.
+///
+/// Each frame does the following, in order:
+///
+/// 1. Re-measures the cell using [`TerminalRenderer::measure_cell`] (cheap;
+///    recalculates font metrics if the font changed since last frame).
+/// 2. Drains pending [`TerminalEvent`]s via
+///    [`process_events`](TerminalView::process_events) so callbacks fire in
+///    the same frame as the event.
+/// 3. Reads the grid's blink state, resolves it against
+///    [`TerminalConfig::cursor_blink_override`], and calls
+///    [`sync_blink`](TerminalView::sync_blink) with the result. This is the
+///    single point where the timer is started/stopped.
+/// 4. Builds the outer `div` (focus, keyboard, mouse handlers, scroll), and
+///    inside it a full-size `canvas` whose paint closure:
+///    - computes `cols`/`rows` from the current bounds and cell size,
+///    - resizes the `Term` and calls the PTY resize callback if they changed,
+///    - resolves the selection endpoints,
+///    - calls [`TerminalRenderer::paint`] passing the resolved blink state
+///      (so `paint`'s hide/show decision matches the timer's phase).
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.renderer.measure_cell(window);
@@ -1287,8 +1705,17 @@ impl Render for TerminalView {
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
-        let selection_start = self.selection_start;
-        let selection_end = self.selection_end;
+        let selection = self.selection.as_ref().map(|s| (s.start, s.end));
+        let cursor_visible = self.cursor_visible;
+
+        let blink_from_grid = self.state.with_term(|term| match term.cursor() {
+            Some(c) => c.blink,
+            None => false,
+        });
+
+        let blink = self.config.cursor_blink_override.unwrap_or(blink_from_grid);
+
+        self.sync_blink(blink, cx);
 
         div()
             .size_full()
@@ -1303,8 +1730,6 @@ impl Render for TerminalView {
                 canvas(
                     move |bounds, _window, _cx| bounds,
                     move |bounds, _, window, cx| {
-                        use alacritty_terminal::grid::Dimensions;
-
                         // Calculate available space after padding
                         let available_width: f32 =
                             (bounds.size.width - padding.left - padding.right).into();
@@ -1315,32 +1740,6 @@ impl Render for TerminalView {
 
                         let cols = ((available_width / cell_width_f32) as usize).max(1);
                         let rows = ((available_height / cell_height_f32) as usize).max(1);
-
-                        // Helper struct implementing Dimensions for resize
-                        struct TermSize {
-                            cols: usize,
-                            rows: usize,
-                        }
-                        impl Dimensions for TermSize {
-                            fn total_lines(&self) -> usize {
-                                self.rows
-                            }
-                            fn screen_lines(&self) -> usize {
-                                self.rows
-                            }
-                            fn columns(&self) -> usize {
-                                self.cols
-                            }
-                            fn last_column(&self) -> alacritty_terminal::index::Column {
-                                alacritty_terminal::index::Column(self.cols.saturating_sub(1))
-                            }
-                            fn bottommost_line(&self) -> alacritty_terminal::index::Line {
-                                alacritty_terminal::index::Line(self.rows as i32 - 1)
-                            }
-                            fn topmost_line(&self) -> alacritty_terminal::index::Line {
-                                alacritty_terminal::index::Line(0)
-                            }
-                        }
 
                         // Resize terminal if dimensions changed
                         let mut term = state_arc.lock();
@@ -1354,13 +1753,17 @@ impl Render for TerminalView {
                             term.resize(TermSize { cols, rows });
                         }
 
-                        let selection = match (selection_start, selection_end) {
-                            (Some(start), Some(end)) => Some((start, end)),
-                            _ => None,
-                        };
-
                         // Paint the terminal with measured dimensions
-                        renderer.paint(bounds, padding, &*term, selection, window, cx);
+                        renderer.paint(
+                            bounds,
+                            padding,
+                            &*term,
+                            selection,
+                            cursor_visible,
+                            blink,
+                            window,
+                            cx,
+                        );
                     },
                 )
                 .size_full(),
@@ -1371,6 +1774,35 @@ impl Render for TerminalView {
 // Tests are omitted due to macro expansion issues with the test attribute
 // in this configuration. Integration tests can be added separately.
 
+/// Translate a window-space position into a grid cell.
+///
+/// # Coordinate system
+///
+/// `pos` is in window pixels. The function subtracts `paddings` so the top-left
+/// of the content area maps to `(0, 0)`, then divides by the cell dimensions
+/// and floors to get the cell index. Negative results are clamped to 0 and
+/// coordinates past the last column/row are clamped to the grid bounds, so a
+/// click just outside the content area still resolves to the nearest cell.
+///
+/// # Scrollback
+///
+/// The visible row index is translated into alacritty's buffer coordinates by
+/// subtracting `display_offset`. This is what makes clicking while scrolled
+/// back select the row the user actually sees, rather than the live row at the
+/// bottom of the buffer.
+///
+/// # Arguments
+///
+/// * `paddings` - Content padding from [`TerminalConfig::padding`]
+/// * `cell_width` / `cell_height` - Measured cell size from the renderer
+/// * `pos` - Pointer position in window pixels
+/// * `term` - The terminal whose dimensions and scroll offset are used for
+///   clamping and translation
+///
+/// # Returns
+///
+/// A grid point in buffer coordinates (may be negative to refer to scrollback
+/// rows).
 fn point_to_cell(
     paddings: Edges<Pixels>,
     cell_width: Pixels,
@@ -1392,4 +1824,53 @@ fn point_to_cell(
     let col_idx = alacritty_terminal::index::Column(col);
 
     alacritty_terminal::index::Point::new(line_idx, col_idx)
+}
+
+/// Adapter that exposes a target `(cols, rows)` pair as alacritty's
+/// [`Dimensions`](alacritty_terminal::grid::Dimensions).
+///
+/// Used only to feed `Term::resize` when the canvas size changes. The terminal
+/// itself is the source of truth for the current size; this type is a
+/// transient "desired size" description.
+struct TermSize {
+    /// Desired number of columns.
+    cols: usize,
+    /// Desired number of rows.
+    rows: usize,
+}
+
+/// [`Dimensions`](alacritty_terminal::grid::Dimensions) adapter for
+/// [`TermSize`].
+///
+/// All methods read directly from the `cols`/`rows` fields; there is no
+/// scrollback in the adapter, so `total_lines == screen_lines == rows` and
+/// `topmost_line == Line(0)`. `last_column` and `bottommost_line` saturate at
+/// 0 for empty dimensions, which matches alacritty's own grid behavior and
+/// avoids underflow on a fully collapsed canvas.
+impl alacritty_terminal::grid::Dimensions for TermSize {
+    /// Total number of lines including scrollback. Equal to `screen_lines`
+    /// here because the adapter has no history.
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+    /// Number of visible lines.
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+    /// Number of columns.
+    fn columns(&self) -> usize {
+        self.cols
+    }
+    /// Index of the last column, saturating to 0 for empty grids.
+    fn last_column(&self) -> alacritty_terminal::index::Column {
+        alacritty_terminal::index::Column(self.cols.saturating_sub(1))
+    }
+    /// Index of the bottommost visible line.
+    fn bottommost_line(&self) -> alacritty_terminal::index::Line {
+        alacritty_terminal::index::Line(self.rows as i32 - 1)
+    }
+    /// Index of the topmost line; always `Line(0)` (no scrollback).
+    fn topmost_line(&self) -> alacritty_terminal::index::Line {
+        alacritty_terminal::index::Line(0)
+    }
 }

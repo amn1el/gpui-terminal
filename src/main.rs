@@ -4,7 +4,7 @@
 //! using portable-pty for proper PTY support.
 
 use anyhow::Result;
-use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
+use gpui_terminal::{ColorPalette, CursorShape, TerminalConfig, TerminalView};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::sync::Arc;
 
@@ -151,7 +151,11 @@ fn main() -> Result<()> {
                 scrollback: 10000,
                 line_height_multiplier: 1.0,
                 padding: Edges::all(px(8.0)),
-                copy_on_select: true,
+                copy_on_select: false,
+                cursor_blink_override: Some(true),
+                cursor_blink_ms: 500,
+                cursor_thickness: 0.15,
+                cursor_shape_override: Some(CursorShape::Beam),
                 colors,
             };
 
