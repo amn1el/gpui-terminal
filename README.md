@@ -15,6 +15,8 @@ A terminal emulator component for [GPUI](https://gpui.rs) applications. Uses [al
 - Dynamic configuration (font size, colors)
 - Push-based async I/O
 - Accepts any `Read`/`Write` streams (not tied to a specific PTY library)
+- Mouse text selection with copy to clipboard
+- Pluggable grid source: draw `alacritty_terminal::Term` or any custom `GridSource`
 
 ## Usage
 
@@ -33,7 +35,49 @@ let terminal = cx.new(|cx| {
 });
 ```
 
-See `src/main.rs` for a complete example using `portable-pty`.
+## Custom grids
+
+The renderer draws anything that implements `GridSource`, not just
+`alacritty_terminal::Term`. This makes it possible to render cells that
+come from another process or machine without spinning up a local VTE
+parser.
+
+`CellGrid` is a ready-made in-memory `GridSource` for that case:
+
+```rust
+use gpui_terminal::{CellGrid, GridSource};
+use alacritty_terminal::term::cell::Cell;
+
+let mut grid = CellGrid::new(24, 80);
+
+// Replace a whole row at once; cells past the end become blank.
+grid.set_line(0, "hello from elsewhere".chars().map(|c| Cell {
+    c,
+    ..Cell::default()
+}));
+
+grid.set_cursor(Some((0, 20)));
+
+// Hand it to the renderer exactly like a `Term`.
+renderer.paint(bounds, padding, &grid, None, window, cx);
+```
+`display_offset` semantics
+Both `CellGrid` and any custom implementation must respect the contract
+defined on `GridSource::display_offset`:
+
+- `0` means the view is pinned to the bottom of the buffer. `cell(0, _)`
+is the top visible row.
+
+- `N > 0` means the user has scrolled `N` rows back into the scrollback.
+
+`cell(line, column)` always receives visible rows; the implementation
+is responsible for subtracting `display_offset` before indexing its
+internal buffer. `Term` does this internally, so scrollback works out of
+the box. `CellGrid` has no scrollback and always reports `0`; whoever
+feeds it must apply scrolling before calling `set_line`.
+
+See `src/main.rs` for a complete example using `portable-pty`, and
+`src/grid.rs` for the `GridSource` trait and `CellGrid`.
 
 ## Configuration
 
@@ -54,14 +98,17 @@ let config = TerminalConfig {
     scrollback: 10000,
     line_height_multiplier: 1.0,
     padding: Edges::all(px(8.0)),
+    copy_on_selection: true,
     colors,
 };
 ```
 
 ## Current Limitations
 
-- Mouse text selection not yet implemented
-- No scrollback navigation
+- No built-in keybindings or scrollbar for scrollback. The renderer honors
+  `display_offset`, so scrolling works if the host application sets it on
+  the `GridSource`, but `TerminalView` does not wire up mouse wheel or
+  `PageUp`/`PageDown` on its own.
 
 ## License
 
