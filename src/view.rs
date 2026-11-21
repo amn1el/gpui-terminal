@@ -49,9 +49,8 @@
 
 use alacritty_terminal::Term;
 use alacritty_terminal::grid::Dimensions;
-use gpui::prelude::FluentBuilder;
 
-use crate::backend::{Edges, *};
+use crate::backend::{Edges, prelude::FluentBuilder, *};
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
@@ -1361,7 +1360,7 @@ impl Render for TerminalView {
                         };
 
                         // Paint the terminal with measured dimensions
-                        renderer.paint(bounds, padding, &term, selection, window, cx);
+                        renderer.paint(bounds, padding, &*term, selection, window, cx);
                     },
                 )
                 .size_full(),

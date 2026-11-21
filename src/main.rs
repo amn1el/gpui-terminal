@@ -4,13 +4,21 @@
 //! using portable-pty for proper PTY support.
 
 use anyhow::Result;
+use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use std::sync::Arc;
+
+#[cfg(feature = "gpui")]
 use gpui::{
     AppContext, Application, Context, Edges, Entity, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, Styled, TitlebarOptions, Window, WindowOptions, div, px,
 };
-use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::sync::Arc;
+
+#[cfg(feature = "gpui-kit")]
+use gpui_kit::{
+    AppContext, Context, Edges, Entity, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, Styled, TitlebarOptions, Window, WindowOptions, application, div, px,
+};
 
 /// Wrapper view that holds the terminal and handles font size shortcuts.
 struct TerminalApp {
@@ -58,7 +66,11 @@ impl Render for TerminalApp {
 }
 
 fn main() -> Result<()> {
+    #[cfg(feature = "gpui")]
     let app = Application::new();
+
+    #[cfg(feature = "gpui-kit")]
+    let app = application();
 
     app.run(move |cx| {
         // Get shell from environment
