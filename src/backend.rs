@@ -1,6 +1,6 @@
 #[cfg(feature = "gpui")]
 mod inner {
-    pub use gpui::{ScrollWheelEvent as ScrollEvent, *};
+    pub use gpui::*;
 
     pub fn paint_shaped_line(
         line: &ShapedLine,
@@ -22,7 +22,7 @@ mod inner {
         V: 'static,
     {
         el.on_scroll_wheel(
-            cx.listener(move |this, event: &ScrollEvent, window, cx| {
+            cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
                 let delta_y = match event.delta {
                     ScrollDelta::Lines(point) => point.y,
                     ScrollDelta::Pixels(point) => f32::from(point.y) / 20.0,
