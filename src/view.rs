@@ -58,7 +58,9 @@ use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
+use std::cell::RefCell;
 use std::io::{Read, Write};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -582,6 +584,8 @@ pub struct TerminalView {
     /// longer matches. This makes restarts race-free without needing to drop
     /// the task from inside itself.
     blink_epoch: usize,
+
+    last_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
 }
 
 impl TerminalView {
@@ -711,6 +715,7 @@ impl TerminalView {
             cursor_visible: true,
             blink_task: None,
             blink_epoch: 0,
+            last_bounds: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -1058,6 +1063,13 @@ impl TerminalView {
         #[cfg(feature = "gpui-kit")]
         window.focus(&self.focus_handle, cx);
 
+        let origin = self
+            .last_bounds
+            .borrow()
+            .map(|b| b.origin)
+            .unwrap_or_default();
+        let local_pos = event.position - origin;
+
         let selection_type = mouse::selection_type_from_clicks(event.click_count);
         let mode = self.state.mode();
 
@@ -1067,7 +1079,7 @@ impl TerminalView {
                     self.config.padding,
                     self.renderer.cell_width,
                     self.renderer.cell_height,
-                    event.position,
+                    local_pos,
                     term,
                 );
                 let start = alacritty_terminal::index::Point::new(
@@ -1094,7 +1106,7 @@ impl TerminalView {
                     self.config.padding,
                     self.renderer.cell_width,
                     self.renderer.cell_height,
-                    event.position,
+                    local_pos,
                     term,
                 );
 
@@ -1136,7 +1148,7 @@ impl TerminalView {
                     self.config.padding,
                     self.renderer.cell_width,
                     self.renderer.cell_height,
-                    event.position,
+                    local_pos,
                     term,
                 );
                 // Mouse reports use *screen* coordinates (0-based from the top
@@ -1173,7 +1185,7 @@ impl TerminalView {
                 self.config.padding,
                 self.renderer.cell_width,
                 self.renderer.cell_height,
-                event.position,
+                local_pos,
                 term,
             );
             self.selection = Some(mouse::Selection::new(
@@ -1196,6 +1208,12 @@ impl TerminalView {
     ///   and the selection is cleared.
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let mode = self.state.mode();
+        let origin = self
+            .last_bounds
+            .borrow()
+            .map(|b| b.origin)
+            .unwrap_or_default();
+        let local_pos = event.position - origin;
 
         if mode.contains(alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK)
             && mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE)
@@ -1205,7 +1223,7 @@ impl TerminalView {
                     self.config.padding,
                     self.renderer.cell_width,
                     self.renderer.cell_height,
-                    event.position,
+                    local_pos,
                     term,
                 );
                 let screen_line = buffer_point.line.0 + term.grid().display_offset() as i32;
@@ -1264,6 +1282,12 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         let mode = self.state.mode();
+        let origin = self
+            .last_bounds
+            .borrow()
+            .map(|b| b.origin)
+            .unwrap_or_default();
+        let local_pos = event.position - origin;
 
         if mode.contains(alacritty_terminal::term::TermMode::MOUSE_MOTION)
             && event.pressed_button == Some(MouseButton::Left)
@@ -1274,7 +1298,7 @@ impl TerminalView {
                     self.config.padding,
                     self.renderer.cell_width,
                     self.renderer.cell_height,
-                    event.position,
+                    local_pos,
                     term,
                 );
                 let screen_line = buffer_point.line.0 + term.grid().display_offset() as i32;
@@ -1309,7 +1333,7 @@ impl TerminalView {
                     self.config.padding,
                     self.renderer.cell_width,
                     self.renderer.cell_height,
-                    event.position,
+                    local_pos,
                     term,
                 );
                 if let Some(sel) = self.selection.as_mut() {
@@ -1707,6 +1731,7 @@ impl Render for TerminalView {
         let padding = self.config.padding;
         let selection = self.selection.as_ref().map(|s| (s.start, s.end));
         let cursor_visible = self.cursor_visible;
+        let last_bounds = self.last_bounds.clone();
 
         let blink_from_grid = self.state.with_term(|term| match term.cursor() {
             Some(c) => c.blink,
@@ -1730,6 +1755,7 @@ impl Render for TerminalView {
                 canvas(
                     move |bounds, _window, _cx| bounds,
                     move |bounds, _, window, cx| {
+                        *last_bounds.borrow_mut() = Some(bounds);
                         // Calculate available space after padding
                         let available_width: f32 =
                             (bounds.size.width - padding.left - padding.right).into();
