@@ -674,7 +674,7 @@ impl TerminalRenderer {
                     window.paint_quad(quad(
                         rect_bounds,
                         px(0.0),
-                        crate::backend::rgba(0x3b82f680),
+                        self.palette.selection(),
                         Edges::<Pixels>::default(),
                         transparent_black(),
                         Default::default(),

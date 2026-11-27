@@ -108,6 +108,9 @@ pub struct ColorPalette {
 
     /// Default cursor color
     cursor: Hsla,
+
+    /// Default selection color
+    selection: Hsla,
 }
 
 impl Default for ColorPalette {
@@ -246,6 +249,11 @@ impl Default for ColorPalette {
             g: 0xff,
             b: 0xff,
         }); // White
+        let selection = rgb_to_hsla(Rgb {
+            r: 0x26,
+            g: 0x4F,
+            b: 0x78,
+        });
 
         Self {
             ansi_colors,
@@ -253,6 +261,7 @@ impl Default for ColorPalette {
             foreground,
             background,
             cursor,
+            selection,
         }
     }
 }
@@ -390,6 +399,11 @@ impl ColorPalette {
     pub fn cursor(&self) -> Hsla {
         self.cursor
     }
+
+    /// Gets the default selection color.
+    pub fn selection(&self) -> Hsla {
+        self.selection
+    }
 }
 
 /// Converts an RGB color to GPUI's Hsla color format.
@@ -480,6 +494,12 @@ impl ColorPaletteBuilder {
     /// Sets the cursor color.
     pub fn cursor(mut self, r: u8, g: u8, b: u8) -> Self {
         self.palette.cursor = rgb_to_hsla(Rgb { r, g, b });
+        self
+    }
+
+    /// Sets the selection color.
+    pub fn selection(mut self, r: u8, g: u8, b: u8) -> Self {
+        self.palette.selection = rgb_to_hsla(Rgb { r, g, b });
         self
     }
 
